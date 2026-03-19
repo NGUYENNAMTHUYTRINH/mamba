@@ -1,0 +1,9 @@
+torch
+einops
+transformers
+ninja
+pandas
+scikit-learn
+pytest
+tqdm
+streamlit

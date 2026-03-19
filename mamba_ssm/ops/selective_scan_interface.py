@@ -15,9 +15,15 @@ except ImportError:
     causal_conv1d_bwd_function = None
     causal_conv1d_update_function = None
 
-from mamba_ssm.ops.triton.layer_norm import _layer_norm_fwd
+try:
+    from mamba_ssm.ops.triton.layer_norm import _layer_norm_fwd
+except ImportError:
+    _layer_norm_fwd = None
 
-import selective_scan_cuda
+try:
+    import selective_scan_cuda
+except ImportError:
+    selective_scan_cuda = None
 
 
 class SelectiveScanFn(torch.autograd.Function):
@@ -25,6 +31,11 @@ class SelectiveScanFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
                 return_last_state=False):
+        if selective_scan_cuda is None:
+            raise RuntimeError(
+                "selective_scan_cuda is not available. Use selective_scan_fn (which falls back "
+                "to selective_scan_ref) or install CUDA extension dependencies."
+            )
         if u.stride(-1) != 1:
             u = u.contiguous()
         if delta.stride(-1) != 1:
@@ -96,9 +107,19 @@ def rms_norm_forward(
     weight = weight.contiguous()
     if bias is not None:
         bias = bias.contiguous()
-    y = _layer_norm_fwd(
-        x, weight, bias, eps, None, residual_dtype=None, is_rms_norm=is_rms_norm
-    )[0]
+    if _layer_norm_fwd is not None:
+        y = _layer_norm_fwd(
+            x, weight, bias, eps, None, residual_dtype=None, is_rms_norm=is_rms_norm
+        )[0]
+    else:
+        if is_rms_norm:
+            var = x.pow(2).mean(dim=-1, keepdim=True)
+            y = x * torch.rsqrt(var + eps)
+        else:
+            y = F.layer_norm(x, (x.shape[-1],), None, None, eps)
+        y = y * weight
+        if bias is not None:
+            y = y + bias
     # y (b l) d
     return y
 
@@ -109,6 +130,19 @@ def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_
     last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
     not considered in the backward pass.
     """
+    if selective_scan_cuda is None:
+        return selective_scan_ref(
+            u,
+            delta,
+            A,
+            B,
+            C,
+            D=D,
+            z=z,
+            delta_bias=delta_bias,
+            delta_softplus=delta_softplus,
+            return_last_state=return_last_state,
+        )
     return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
 
 
@@ -376,6 +410,24 @@ def mamba_inner_fn(
     A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
     C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1, b_rms_weight= None, c_rms_weight= None, dt_rms_weight= None, b_c_dt_rms_eps=1e-6
 ):
+    if selective_scan_cuda is None:
+        return mamba_inner_ref(
+            xz,
+            conv1d_weight,
+            conv1d_bias,
+            x_proj_weight,
+            delta_proj_weight,
+            out_proj_weight,
+            out_proj_bias,
+            A,
+            B=B,
+            C=C,
+            D=D,
+            delta_bias=delta_bias,
+            B_proj_bias=B_proj_bias,
+            C_proj_bias=C_proj_bias,
+            delta_softplus=delta_softplus,
+        )
     return MambaInnerFn.apply(xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
                               out_proj_weight, out_proj_bias,
                               A, B, C, D, delta_bias, B_proj_bias, C_proj_bias, delta_softplus, checkpoint_lvl, b_rms_weight, c_rms_weight, dt_rms_weight, b_c_dt_rms_eps)

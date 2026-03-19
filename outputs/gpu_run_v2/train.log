@@ -1,0 +1,59 @@
+2026-03-18 20:33:51,962 | INFO | Loading dataset from: dataset/2025.csv
+2026-03-18 20:33:53,018 | INFO | Total rows loaded: 663197
+2026-03-18 20:33:53,654 | INFO | Using numeric features (20): ['pm25', 'pm10', 'no2', 'o3', 'so2', 'co', 'aod', 'dust', 'uv_index', 'co2', 'aqi_pm25', 'aqi_pm10', 'aqi_no2', 'aqi_o3', 'aqi_so2', 'aqi_co', 'hour', 'dayofweek', 'month', 'dayofyear']
+2026-03-18 20:33:53,656 | INFO | Number of unique locations: 79
+2026-03-18 20:33:53,990 | INFO | Split sizes:
+2026-03-18 20:33:53,990 | INFO |   train: 464237 (70.00%)
+2026-03-18 20:33:53,991 | INFO |   val  : 66320 (10.00%)
+2026-03-18 20:33:53,991 | INFO |   test : 132640 (20.00%)
+2026-03-18 20:33:54,028 | INFO | Training device: cuda
+2026-03-18 20:33:54,030 | INFO | GPU: NVIDIA GeForce RTX 3050 Laptop GPU
+2026-03-18 20:33:54,033 | INFO | AMP enabled: False
+2026-03-18 20:33:54,033 | INFO | Gradient accumulation steps: 2
+2026-03-18 20:34:12,416 | INFO | Epoch 1/1 | step 100/3627 | batch_loss=0.143465 | running_avg=0.246730
+2026-03-18 20:34:26,016 | INFO | Epoch 1/1 | step 200/3627 | batch_loss=0.144146 | running_avg=0.197220
+2026-03-18 20:34:39,605 | INFO | Epoch 1/1 | step 300/3627 | batch_loss=0.089366 | running_avg=0.173687
+2026-03-18 20:34:53,228 | INFO | Epoch 1/1 | step 400/3627 | batch_loss=0.106665 | running_avg=0.156033
+2026-03-18 20:35:06,939 | INFO | Epoch 1/1 | step 500/3627 | batch_loss=0.107249 | running_avg=0.144832
+2026-03-18 20:35:20,577 | INFO | Epoch 1/1 | step 600/3627 | batch_loss=0.095784 | running_avg=0.134901
+2026-03-18 20:35:34,222 | INFO | Epoch 1/1 | step 700/3627 | batch_loss=0.059009 | running_avg=0.126855
+2026-03-18 20:35:48,035 | INFO | Epoch 1/1 | step 800/3627 | batch_loss=0.079802 | running_avg=0.119467
+2026-03-18 20:36:01,717 | INFO | Epoch 1/1 | step 900/3627 | batch_loss=0.057570 | running_avg=0.112651
+2026-03-18 20:36:15,374 | INFO | Epoch 1/1 | step 1000/3627 | batch_loss=0.049629 | running_avg=0.106862
+2026-03-18 20:36:29,002 | INFO | Epoch 1/1 | step 1100/3627 | batch_loss=0.050426 | running_avg=0.101421
+2026-03-18 20:36:42,678 | INFO | Epoch 1/1 | step 1200/3627 | batch_loss=0.037960 | running_avg=0.096688
+2026-03-18 20:36:56,414 | INFO | Epoch 1/1 | step 1300/3627 | batch_loss=0.043135 | running_avg=0.092239
+2026-03-18 20:37:10,120 | INFO | Epoch 1/1 | step 1400/3627 | batch_loss=0.032501 | running_avg=0.088252
+2026-03-18 20:37:23,798 | INFO | Epoch 1/1 | step 1500/3627 | batch_loss=0.030909 | running_avg=0.084636
+2026-03-18 20:37:37,476 | INFO | Epoch 1/1 | step 1600/3627 | batch_loss=0.023970 | running_avg=0.081341
+2026-03-18 20:37:51,107 | INFO | Epoch 1/1 | step 1700/3627 | batch_loss=0.025755 | running_avg=0.078342
+2026-03-18 20:38:04,808 | INFO | Epoch 1/1 | step 1800/3627 | batch_loss=0.039539 | running_avg=0.075489
+2026-03-18 20:38:18,580 | INFO | Epoch 1/1 | step 1900/3627 | batch_loss=0.028239 | running_avg=0.072817
+2026-03-18 20:38:32,304 | INFO | Epoch 1/1 | step 2000/3627 | batch_loss=0.019407 | running_avg=0.070337
+2026-03-18 20:38:45,986 | INFO | Epoch 1/1 | step 2100/3627 | batch_loss=0.022790 | running_avg=0.068056
+2026-03-18 20:38:59,636 | INFO | Epoch 1/1 | step 2200/3627 | batch_loss=0.017600 | running_avg=0.065962
+2026-03-18 20:39:13,307 | INFO | Epoch 1/1 | step 2300/3627 | batch_loss=0.016969 | running_avg=0.064018
+2026-03-18 20:39:27,004 | INFO | Epoch 1/1 | step 2400/3627 | batch_loss=0.023383 | running_avg=0.062140
+2026-03-18 20:39:40,664 | INFO | Epoch 1/1 | step 2500/3627 | batch_loss=0.016354 | running_avg=0.060368
+2026-03-18 20:39:54,363 | INFO | Epoch 1/1 | step 2600/3627 | batch_loss=0.015605 | running_avg=0.058717
+2026-03-18 20:40:08,093 | INFO | Epoch 1/1 | step 2700/3627 | batch_loss=0.016091 | running_avg=0.057162
+2026-03-18 20:40:21,896 | INFO | Epoch 1/1 | step 2800/3627 | batch_loss=0.015524 | running_avg=0.055684
+2026-03-18 20:40:35,549 | INFO | Epoch 1/1 | step 2900/3627 | batch_loss=0.012754 | running_avg=0.054292
+2026-03-18 20:40:49,236 | INFO | Epoch 1/1 | step 3000/3627 | batch_loss=0.013989 | running_avg=0.052977
+2026-03-18 20:41:02,922 | INFO | Epoch 1/1 | step 3100/3627 | batch_loss=0.012743 | running_avg=0.051729
+2026-03-18 20:41:16,693 | INFO | Epoch 1/1 | step 3200/3627 | batch_loss=0.013806 | running_avg=0.050563
+2026-03-18 20:41:30,452 | INFO | Epoch 1/1 | step 3300/3627 | batch_loss=0.015824 | running_avg=0.049465
+2026-03-18 20:41:44,162 | INFO | Epoch 1/1 | step 3400/3627 | batch_loss=0.009329 | running_avg=0.048404
+2026-03-18 20:41:57,811 | INFO | Epoch 1/1 | step 3500/3627 | batch_loss=0.015122 | running_avg=0.047373
+2026-03-18 20:42:13,323 | INFO | Epoch 1/1 | step 3600/3627 | batch_loss=0.012741 | running_avg=0.046407
+2026-03-18 20:42:17,819 | INFO | Epoch 1/1 | step 3627/3627 | batch_loss=0.012909 | running_avg=0.054204
+2026-03-18 20:42:27,780 | INFO | Epoch 01/01 | train_loss=0.046160 | val_loss=0.011985 | val_mae=4.6371 | val_rmse=6.2718 | val_r2=0.9759 | train_sec=501.7
+2026-03-18 20:42:27,811 | INFO | New best checkpoint saved: outputs/gpu_run_v2\best_mamba_aqi.pt
+2026-03-18 20:42:38,462 | INFO | Best model evaluation on TEST set:
+2026-03-18 20:42:38,463 | INFO |   test_loss: 0.011828
+2026-03-18 20:42:38,463 | INFO |   test_mae : 4.6255
+2026-03-18 20:42:38,463 | INFO |   test_rmse: 6.2308
+2026-03-18 20:42:38,463 | INFO |   test_r2  : 0.9763
+2026-03-18 20:42:38,463 | INFO | Saved best model to: outputs/gpu_run_v2\best_mamba_aqi.pt
+2026-03-18 20:42:38,463 | INFO | Saved training history to: outputs/gpu_run_v2\metrics_history.csv
+2026-03-18 20:42:38,464 | INFO | Saved raw logs to: outputs/gpu_run_v2\train.log
