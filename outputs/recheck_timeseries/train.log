@@ -1,0 +1,52 @@
+2026-03-23 01:34:06,451 | INFO | Loading dataset from: dataset/2025.csv
+2026-03-23 01:34:07,298 | INFO | Total rows loaded: 663197
+2026-03-23 01:34:10,513 | INFO | Using sequence features (25): ['pm25', 'pm10', 'no2', 'o3', 'so2', 'co', 'aod', 'dust', 'uv_index', 'co2', 'aqi_pm25', 'aqi_pm10', 'aqi_no2', 'aqi_o3', 'aqi_so2', 'aqi_co', 'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos', 'month_sin', 'month_cos', 'doy_sin', 'doy_cos', 'aqi']
+2026-03-23 01:34:10,514 | INFO | Number of unique locations: 79
+2026-03-23 01:34:10,514 | INFO | Sequence length: 24 | Horizon: 1
+2026-03-23 01:34:13,424 | INFO | Split sizes:
+2026-03-23 01:34:13,424 | INFO |   train: 462877 (69.99%)
+2026-03-23 01:34:13,425 | INFO |   val  : 66091 (9.99%)
+2026-03-23 01:34:13,427 | INFO |   test : 132333 (20.01%)
+2026-03-23 01:34:13,493 | INFO | Training device: cuda
+2026-03-23 01:34:13,497 | INFO | GPU: NVIDIA GeForce RTX 3050 Laptop GPU
+2026-03-23 01:34:13,497 | INFO | AMP enabled: False
+2026-03-23 01:34:13,497 | INFO | Gradient accumulation steps: 1
+2026-03-23 01:34:34,919 | INFO | Epoch 1/2 | step 50/1809 | batch_loss=0.024532 | running_avg=0.093704
+2026-03-23 01:34:51,063 | INFO | Epoch 1/2 | step 100/1809 | batch_loss=0.009193 | running_avg=0.053579
+2026-03-23 01:35:07,210 | INFO | Epoch 1/2 | step 150/1809 | batch_loss=0.005516 | running_avg=0.038010
+2026-03-23 01:35:23,289 | INFO | Epoch 1/2 | step 200/1809 | batch_loss=0.003363 | running_avg=0.029879
+2026-03-23 01:35:39,370 | INFO | Epoch 1/2 | step 250/1809 | batch_loss=0.002786 | running_avg=0.024773
+2026-03-23 01:35:55,501 | INFO | Epoch 1/2 | step 300/1809 | batch_loss=0.003947 | running_avg=0.021257
+2026-03-23 01:36:11,550 | INFO | Epoch 1/2 | step 350/1809 | batch_loss=0.003826 | running_avg=0.018644
+2026-03-23 01:36:27,633 | INFO | Epoch 1/2 | step 400/1809 | batch_loss=0.003628 | running_avg=0.016690
+2026-03-23 01:36:43,499 | INFO | Epoch 1/2 | step 450/1809 | batch_loss=0.002838 | running_avg=0.015134
+2026-03-23 01:36:59,512 | INFO | Epoch 1/2 | step 500/1809 | batch_loss=0.002072 | running_avg=0.013878
+2026-03-23 01:37:15,665 | INFO | Epoch 1/2 | step 550/1809 | batch_loss=0.002175 | running_avg=0.012841
+2026-03-23 01:37:31,791 | INFO | Epoch 1/2 | step 600/1809 | batch_loss=0.001669 | running_avg=0.011982
+2026-03-23 01:37:47,905 | INFO | Epoch 1/2 | step 650/1809 | batch_loss=0.001632 | running_avg=0.011224
+2026-03-23 01:38:04,043 | INFO | Epoch 1/2 | step 700/1809 | batch_loss=0.001322 | running_avg=0.010565
+2026-03-23 01:38:20,139 | INFO | Epoch 1/2 | step 750/1809 | batch_loss=0.001961 | running_avg=0.010002
+2026-03-23 01:38:36,243 | INFO | Epoch 1/2 | step 800/1809 | batch_loss=0.001582 | running_avg=0.009508
+2026-03-23 01:38:52,364 | INFO | Epoch 1/2 | step 850/1809 | batch_loss=0.003461 | running_avg=0.009060
+2026-03-23 01:39:08,517 | INFO | Epoch 1/2 | step 900/1809 | batch_loss=0.001989 | running_avg=0.008656
+2026-03-23 01:39:24,652 | INFO | Epoch 1/2 | step 950/1809 | batch_loss=0.001539 | running_avg=0.008310
+2026-03-23 01:39:40,788 | INFO | Epoch 1/2 | step 1000/1809 | batch_loss=0.001665 | running_avg=0.007975
+2026-03-23 01:39:57,010 | INFO | Epoch 1/2 | step 1050/1809 | batch_loss=0.001167 | running_avg=0.007670
+2026-03-23 01:40:13,330 | INFO | Epoch 1/2 | step 1100/1809 | batch_loss=0.001438 | running_avg=0.007396
+2026-03-23 01:40:29,477 | INFO | Epoch 1/2 | step 1150/1809 | batch_loss=0.001645 | running_avg=0.007141
+2026-03-23 01:40:45,732 | INFO | Epoch 1/2 | step 1200/1809 | batch_loss=0.001257 | running_avg=0.006900
+2026-03-23 01:41:01,880 | INFO | Epoch 1/2 | step 1250/1809 | batch_loss=0.001655 | running_avg=0.006689
+2026-03-23 01:41:18,002 | INFO | Epoch 1/2 | step 1300/1809 | batch_loss=0.001459 | running_avg=0.006490
+2026-03-23 01:41:34,070 | INFO | Epoch 1/2 | step 1350/1809 | batch_loss=0.001065 | running_avg=0.006303
+2026-03-23 01:41:50,138 | INFO | Epoch 1/2 | step 1400/1809 | batch_loss=0.001349 | running_avg=0.006129
+2026-03-23 01:42:06,209 | INFO | Epoch 1/2 | step 1450/1809 | batch_loss=0.002058 | running_avg=0.005966
+2026-03-23 01:42:22,273 | INFO | Epoch 1/2 | step 1500/1809 | batch_loss=0.000908 | running_avg=0.005811
+2026-03-23 01:42:38,341 | INFO | Epoch 1/2 | step 1550/1809 | batch_loss=0.001647 | running_avg=0.005665
+2026-03-23 01:42:54,440 | INFO | Epoch 1/2 | step 1600/1809 | batch_loss=0.000923 | running_avg=0.005525
+2026-03-23 01:43:10,559 | INFO | Epoch 1/2 | step 1650/1809 | batch_loss=0.001307 | running_avg=0.005398
+2026-03-23 01:43:26,847 | INFO | Epoch 1/2 | step 1700/1809 | batch_loss=0.000873 | running_avg=0.005278
+2026-03-23 01:43:43,428 | INFO | Epoch 1/2 | step 1750/1809 | batch_loss=0.000965 | running_avg=0.005162
+2026-03-23 01:43:59,254 | INFO | Epoch 1/2 | step 1800/1809 | batch_loss=0.001021 | running_avg=0.005049
+2026-03-23 01:44:01,869 | INFO | Epoch 1/2 | step 1809/1809 | batch_loss=0.000616 | running_avg=0.044387
+2026-03-23 01:44:06,522 | INFO | Epoch 01/02 | train_loss=0.005031 | val_loss=0.001106 | val_mae=1.3554 | val_rmse=1.9482 | val_r2=0.9970 | train_sec=586.1
+2026-03-23 01:44:06,535 | INFO | New best checkpoint saved: outputs/recheck_timeseries\best_mamba_aqi.pt

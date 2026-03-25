@@ -10,7 +10,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -19,14 +18,14 @@ from mamba_ssm import Mamba
 
 @dataclass
 class SplitData:
-    x_num: np.ndarray
+    x_seq: np.ndarray
     loc_ids: np.ndarray
     y: np.ndarray
 
 
 class AQIDataset(Dataset):
     def __init__(self, split: SplitData):
-        self.x_num = torch.from_numpy(split.x_num).float()
+        self.x_seq = torch.from_numpy(split.x_seq).float()
         self.loc_ids = torch.from_numpy(split.loc_ids).long()
         self.y = torch.from_numpy(split.y).float()
 
@@ -34,13 +33,13 @@ class AQIDataset(Dataset):
         return self.y.shape[0]
 
     def __getitem__(self, idx):
-        return self.x_num[idx], self.loc_ids[idx], self.y[idx]
+        return self.x_seq[idx], self.loc_ids[idx], self.y[idx]
 
 
-class TabularMambaRegressor(nn.Module):
-    def __init__(self, num_numeric_features: int, num_locations: int, d_model: int = 64, n_layers: int = 2):
+class TimeSeriesMambaRegressor(nn.Module):
+    def __init__(self, num_features: int, num_locations: int, d_model: int = 64, n_layers: int = 2):
         super().__init__()
-        self.scalar_proj = nn.Linear(1, d_model)
+        self.feature_proj = nn.Linear(num_features, d_model)
         self.location_emb = nn.Embedding(num_locations, d_model)
         self.layers = nn.ModuleList(
             [
@@ -60,20 +59,20 @@ class TabularMambaRegressor(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, 1),
         )
-        self.num_numeric_features = num_numeric_features
+        self.num_features = num_features
 
-    def forward(self, x_num: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
-        # x_num: (B, F)
-        x = self.scalar_proj(x_num.unsqueeze(-1))  # (B, F, d_model)
+    def forward(self, x_seq: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
+        # x_seq: (B, T, F)
+        x = self.feature_proj(x_seq)  # (B, T, d_model)
         loc_token = self.location_emb(loc_ids).unsqueeze(1)  # (B, 1, d_model)
-        x = torch.cat([loc_token, x], dim=1)  # (B, F+1, d_model)
+        x = torch.cat([loc_token, x], dim=1)  # (B, T+1, d_model)
 
         for layer in self.layers:
             x = layer(x)
 
         x = self.norm(x)
-        pooled = x.mean(dim=1)
-        return self.head(pooled).squeeze(-1)
+        last_token = x[:, -1, :]
+        return self.head(last_token).squeeze(-1)
 
 
 def setup_logger(out_dir: str):
@@ -101,29 +100,33 @@ def resolve_device(device_arg: str):
     return torch.device(device_arg)
 
 
-def build_features(df: pd.DataFrame, target_col: str):
+def build_time_series_samples(df: pd.DataFrame, target_col: str, window_size: int, horizon: int):
     if target_col not in df.columns:
         raise ValueError(f"Target column '{target_col}' not found in dataset columns: {df.columns.tolist()}")
+    if "ts_utc" not in df.columns:
+        raise ValueError("Expected 'ts_utc' column for chronological time-series training.")
+    if "location_key" not in df.columns:
+        raise ValueError("Expected 'location_key' column in dataset for location embedding.")
+    if window_size < 1:
+        raise ValueError("window_size must be >= 1")
+    if horizon < 1:
+        raise ValueError("horizon must be >= 1")
 
     work = df.copy()
+    work["_ts"] = pd.to_datetime(work["ts_utc"], utc=True, errors="coerce")
+    work = work.dropna(subset=["_ts", "location_key", target_col]).copy()
+    if work.empty:
+        raise ValueError("No valid rows after dropping missing ts_utc/location_key/target.")
 
-    if "ts_utc" in work.columns:
-        ts = pd.to_datetime(work["ts_utc"], utc=True, errors="coerce")
-        work["hour"] = ts.dt.hour.fillna(0).astype(np.float32)
-        work["dayofweek"] = ts.dt.dayofweek.fillna(0).astype(np.float32)
-        work["month"] = ts.dt.month.fillna(1).astype(np.float32)
-        work["dayofyear"] = ts.dt.dayofyear.fillna(1).astype(np.float32)
+    work["_loc_id"] = work["location_key"].astype("category").cat.codes.astype(np.int64)
+    num_locations = int(work["_loc_id"].max()) + 1
 
-    if "location_key" not in work.columns:
-        raise ValueError("Expected 'location_key' column in dataset for location embedding.")
-
-    location_codes = work["location_key"].astype("category").cat.codes.to_numpy(dtype=np.int64)
-    num_locations = int(location_codes.max()) + 1
-
-    # Use all numeric columns except target as model input.
+    # Keep only numeric environmental features in model input (exclude metadata columns).
     numeric_cols = work.select_dtypes(include=[np.number]).columns.tolist()
     if target_col in numeric_cols:
         numeric_cols.remove(target_col)
+    if "_loc_id" in numeric_cols:
+        numeric_cols.remove("_loc_id")
 
     if not numeric_cols:
         raise ValueError("No numeric feature columns found after excluding target column.")
@@ -135,37 +138,81 @@ def build_features(df: pd.DataFrame, target_col: str):
             median_val = 0.0
         work[col] = work[col].fillna(median_val)
 
-    # Target missing values are removed because supervised training needs labels.
-    work = work.loc[~work[target_col].isna()].copy()
-    location_codes = location_codes[work.index.to_numpy()]
+    work = work.sort_values(["_loc_id", "_ts"]).reset_index(drop=True)
 
-    x_num = work[numeric_cols].to_numpy(dtype=np.float32)
-    y = work[target_col].to_numpy(dtype=np.float32)
+    x_seq_list = []
+    loc_id_list = []
+    y_list = []
+    y_ts_list = []
 
-    return x_num, location_codes, y, num_locations, numeric_cols
+    for loc_id, group in work.groupby("_loc_id", sort=False):
+        x_vals = group[numeric_cols].to_numpy(dtype=np.float32)
+        y_vals = group[target_col].to_numpy(dtype=np.float32)
+        ts_vals = group["_ts"].to_numpy(dtype="datetime64[ns]")
+        n = len(group)
+
+        max_start = n - window_size - horizon + 1
+        if max_start <= 0:
+            continue
+
+        for start in range(max_start):
+            end = start + window_size
+            target_idx = end + horizon - 1
+            x_seq_list.append(x_vals[start:end])
+            loc_id_list.append(loc_id)
+            y_list.append(y_vals[target_idx])
+            y_ts_list.append(ts_vals[target_idx])
+
+    if not x_seq_list:
+        raise ValueError(
+            "No time-series samples created. Reduce --window-size/--horizon or provide more rows per location."
+        )
+
+    x_seq = np.stack(x_seq_list).astype(np.float32)
+    loc_ids = np.asarray(loc_id_list, dtype=np.int64)
+    y = np.asarray(y_list, dtype=np.float32)
+    y_ts = np.asarray(y_ts_list, dtype="datetime64[ns]")
+
+    return x_seq, loc_ids, y, y_ts, num_locations, numeric_cols
 
 
-def split_data(x_num: np.ndarray, loc_ids: np.ndarray, y: np.ndarray, seed: int = 42):
-    indices = np.arange(len(y))
+def split_data_by_timeline(
+    x_seq: np.ndarray,
+    loc_ids: np.ndarray,
+    y: np.ndarray,
+    y_ts: np.ndarray,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.1,
+):
+    if len(y) < 3:
+        raise ValueError("Need at least 3 samples for train/val/test split.")
 
-    train_idx, temp_idx = train_test_split(indices, test_size=0.30, random_state=seed, shuffle=True)
-    # From remaining 30%, split to val/test => val=10% overall, test=20% overall.
-    val_idx, test_idx = train_test_split(temp_idx, test_size=(2.0 / 3.0), random_state=seed, shuffle=True)
+    order = np.argsort(y_ts)
+    n = len(order)
+    train_end = int(n * train_ratio)
+    val_end = train_end + int(n * val_ratio)
 
-    train = SplitData(x_num=x_num[train_idx], loc_ids=loc_ids[train_idx], y=y[train_idx])
-    val = SplitData(x_num=x_num[val_idx], loc_ids=loc_ids[val_idx], y=y[val_idx])
-    test = SplitData(x_num=x_num[test_idx], loc_ids=loc_ids[test_idx], y=y[test_idx])
+    if train_end <= 0 or val_end <= train_end or val_end >= n:
+        raise ValueError("Invalid timeline split sizes. Need more samples or adjust ratios.")
+
+    train_idx = order[:train_end]
+    val_idx = order[train_end:val_end]
+    test_idx = order[val_end:]
+
+    train = SplitData(x_seq=x_seq[train_idx], loc_ids=loc_ids[train_idx], y=y[train_idx])
+    val = SplitData(x_seq=x_seq[val_idx], loc_ids=loc_ids[val_idx], y=y[val_idx])
+    test = SplitData(x_seq=x_seq[test_idx], loc_ids=loc_ids[test_idx], y=y[test_idx])
     return train, val, test
 
 
 def standardize(train: SplitData, val: SplitData, test: SplitData):
-    mean = train.x_num.mean(axis=0, keepdims=True)
-    std = train.x_num.std(axis=0, keepdims=True)
+    mean = train.x_seq.mean(axis=(0, 1), keepdims=True)
+    std = train.x_seq.std(axis=(0, 1), keepdims=True)
     std = np.where(std < 1e-6, 1.0, std)
 
-    train.x_num = (train.x_num - mean) / std
-    val.x_num = (val.x_num - mean) / std
-    test.x_num = (test.x_num - mean) / std
+    train.x_seq = (train.x_seq - mean) / std
+    val.x_seq = (val.x_seq - mean) / std
+    test.x_seq = (test.x_seq - mean) / std
 
     y_mean = float(train.y.mean())
     y_std = float(train.y.std())
@@ -200,13 +247,13 @@ def run_epoch(
     amp_enabled = use_amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     pbar = tqdm(loader, desc=f"Train {epoch_idx}/{total_epochs}", leave=False)
-    for step, (x_num, loc_ids, y) in enumerate(pbar, start=1):
-        x_num = x_num.to(device)
+    for step, (x_seq, loc_ids, y) in enumerate(pbar, start=1):
+        x_seq = x_seq.to(device)
         loc_ids = loc_ids.to(device)
         y = y.to(device)
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-            pred = model(x_num, loc_ids)
+            pred = model(x_seq, loc_ids)
             loss = criterion(pred, y)
             loss_for_backward = loss / grad_accum_steps
 
@@ -260,13 +307,13 @@ def evaluate(model, loader, criterion, device, use_amp, y_mean, y_std):
     targets = []
     amp_enabled = use_amp and device.type == "cuda"
 
-    for x_num, loc_ids, y in loader:
-        x_num = x_num.to(device)
+    for x_seq, loc_ids, y in loader:
+        x_seq = x_seq.to(device)
         loc_ids = loc_ids.to(device)
         y = y.to(device)
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-            pred = model(x_num, loc_ids)
+            pred = model(x_seq, loc_ids)
             loss = criterion(pred, y)
 
         total_loss += loss.item() * y.size(0)
@@ -295,6 +342,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train/val/test AQI prediction with Mamba (single script)")
     parser.add_argument("--data-path", type=str, default="dataset/2025.csv")
     parser.add_argument("--target-col", type=str, default="aqi")
+    parser.add_argument("--window-size", type=int, default=24, help="Input timesteps T for each sample")
+    parser.add_argument("--horizon", type=int, default=1, help="Predict y(t+horizon) from last step in window")
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -322,11 +371,18 @@ def main():
     df = pd.read_csv(args.data_path)
     logger.info("Total rows loaded: %d", len(df))
 
-    x_num, loc_ids, y, num_locations, feature_cols = build_features(df, args.target_col)
+    x_seq, loc_ids, y, y_ts, num_locations, feature_cols = build_time_series_samples(
+        df=df,
+        target_col=args.target_col,
+        window_size=args.window_size,
+        horizon=args.horizon,
+    )
     logger.info("Using numeric features (%d): %s", len(feature_cols), feature_cols)
+    logger.info("Window size: %d | Horizon: %d", args.window_size, args.horizon)
+    logger.info("Total time-series samples: %d", len(y))
     logger.info("Number of unique locations: %d", num_locations)
 
-    train, val, test = split_data(x_num, loc_ids, y, seed=args.seed)
+    train, val, test = split_data_by_timeline(x_seq, loc_ids, y, y_ts)
     train, val, test, y_mean, y_std = standardize(train, val, test)
 
     logger.info("Split sizes:")
@@ -338,7 +394,7 @@ def main():
     train_loader = DataLoader(
         AQIDataset(train),
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
     )
@@ -368,8 +424,8 @@ def main():
     logger.info("AMP enabled: %s", use_amp)
     logger.info("Gradient accumulation steps: %d", args.grad_accum_steps)
 
-    model = TabularMambaRegressor(
-        num_numeric_features=train.x_num.shape[1],
+    model = TimeSeriesMambaRegressor(
+        num_features=train.x_seq.shape[-1],
         num_locations=num_locations,
         d_model=args.d_model,
         n_layers=args.n_layers,

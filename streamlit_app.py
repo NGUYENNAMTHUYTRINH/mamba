@@ -15,21 +15,23 @@ from mamba_ssm import Mamba
 
 
 class TabularDataset(Dataset):
-    def __init__(self, x: np.ndarray, y: np.ndarray):
+    def __init__(self, x: np.ndarray, loc_ids: np.ndarray, y: np.ndarray):
         self.x = torch.from_numpy(x).float()
+        self.loc_ids = torch.from_numpy(loc_ids).long()
         self.y = torch.from_numpy(y).float()
 
     def __len__(self):
         return self.y.shape[0]
 
     def __getitem__(self, idx):
-        return self.x[idx], self.y[idx]
+        return self.x[idx], self.loc_ids[idx], self.y[idx]
 
 
 class TabularMambaRegressor(nn.Module):
-    def __init__(self, num_features: int, d_model: int = 64, n_layers: int = 2):
+    def __init__(self, num_features: int, num_locations: int, d_model: int = 64, n_layers: int = 2):
         super().__init__()
         self.scalar_proj = nn.Linear(1, d_model)
+        self.location_emb = nn.Embedding(num_locations, d_model)
         self.layers = nn.ModuleList(
             [
                 Mamba(
@@ -50,9 +52,11 @@ class TabularMambaRegressor(nn.Module):
         )
         self.num_features = num_features
 
-    def forward(self, x_num: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_num: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
         # x_num: (B, F)
         x = self.scalar_proj(x_num.unsqueeze(-1))  # (B, F, d_model)
+        loc_token = self.location_emb(loc_ids).unsqueeze(1)  # (B, 1, d_model)
+        x = torch.cat([loc_token, x], dim=1)  # (B, F+1, d_model)
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x)
@@ -68,6 +72,17 @@ def unique_keep_order(items: list[str]) -> list[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def sanitize_filename(text: str) -> str:
+    safe = []
+    for ch in str(text).strip().lower():
+        if ch.isalnum() or ch in ["_", "-"]:
+            safe.append(ch)
+        else:
+            safe.append("_")
+    name = "".join(safe).strip("_")
+    return name or "unknown_location"
 
 
 def encode_selected_features(df: pd.DataFrame, feature_cols: list[str]) -> tuple[np.ndarray, list[str]]:
@@ -215,18 +230,23 @@ def make_split_indices(df_valid: pd.DataFrame, seed: int, split_mode: str) -> tu
 
 
 def build_future_24h_frame(df_valid: pd.DataFrame, feature_cols: list[str], target_col: str) -> pd.DataFrame:
-    if "ts_utc" not in df_valid.columns or "location_key" not in df_valid.columns:
-        raise ValueError("Cần có 'ts_utc' và 'location_key' để dự báo 24h cho 79 địa điểm.")
+    if "ts_utc" not in df_valid.columns:
+        raise ValueError("Cần có cột 'ts_utc' để dự báo 24h tiếp theo.")
 
     work = df_valid.copy()
     work["ts_utc"] = pd.to_datetime(work["ts_utc"], utc=True, errors="coerce")
     work = work.dropna(subset=["ts_utc"]).copy()
 
     future_rows = []
-    locations = sorted(work["location_key"].dropna().astype(str).unique().tolist())
+    if "location_key" in work.columns:
+        groups = [
+            (loc, work.loc[work["location_key"].astype(str) == loc].sort_values("ts_utc").copy())
+            for loc in sorted(work["location_key"].dropna().astype(str).unique().tolist())
+        ]
+    else:
+        groups = [(None, work.sort_values("ts_utc").copy())]
 
-    for loc in locations:
-        g = work.loc[work["location_key"].astype(str) == loc].sort_values("ts_utc").copy()
+    for loc, g in groups:
         if g.empty:
             continue
 
@@ -240,7 +260,8 @@ def build_future_24h_frame(df_valid: pd.DataFrame, feature_cols: list[str], targ
         for h in range(24):
             src = template.iloc[h].copy()
             row = {col: src[col] for col in feature_cols if col in template.columns}
-            row["location_key"] = loc
+            if loc is not None:
+                row["location_key"] = loc
             row["ts_utc"] = next_day_start + pd.Timedelta(hours=h)
             row[target_col] = np.nan
             future_rows.append(row)
@@ -258,11 +279,12 @@ def evaluate(model, loader, criterion, device, y_mean, y_std):
     preds = []
     targets = []
 
-    for xb, yb in loader:
+    for xb, loc_ids, yb in loader:
         xb = xb.to(device)
+        loc_ids = loc_ids.to(device)
         yb = yb.to(device)
 
-        out = model(xb)
+        out = model(xb, loc_ids)
         loss = criterion(out, yb)
 
         total_loss += loss.item() * yb.size(0)
@@ -293,6 +315,7 @@ def evaluate(model, loader, criterion, device, y_mean, y_std):
 def train_pipeline(
     df: pd.DataFrame,
     forecast_base_df: pd.DataFrame | None,
+    selected_locations: list[str],
     target_col: str,
     feature_cols: list[str],
     epochs: int,
@@ -309,6 +332,9 @@ def train_pipeline(
     grad_accum_steps: int,
     max_grad_norm: float,
     split_mode: str,
+    run_dir: str | None = None,
+    forecast_file_name: str = "future_24h_predictions.csv",
+    export_per_location_files: bool = False,
 ):
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -318,26 +344,46 @@ def train_pipeline(
     if not feature_cols:
         raise ValueError("Không có feature hợp lệ sau khi loại target/column không tồn tại.")
 
-    x_all, encoded_feature_names = encode_selected_features(df, feature_cols)
-    y_all = pd.to_numeric(df[target_col], errors="coerce")
+    work_df = df.copy()
+    if "location_key" not in work_df.columns:
+        raise ValueError("Dataset train cần có cột location_key cho embedding.")
+
+    work_df = work_df.loc[work_df["location_key"].astype(str).isin([str(x) for x in selected_locations])].copy()
+    if work_df.empty:
+        raise ValueError("Không có dữ liệu train cho các location đã chọn.")
+
+    x_all, encoded_feature_names = encode_selected_features(work_df, feature_cols)
+    y_all = pd.to_numeric(work_df[target_col], errors="coerce")
 
     valid_mask = ~y_all.isna()
     x_all = x_all[valid_mask.to_numpy()]
     y_all = y_all[valid_mask].to_numpy(dtype=np.float32)
-    df_valid = df.loc[valid_mask].copy().reset_index(drop=True)
+    df_valid = work_df.loc[valid_mask].copy().reset_index(drop=True)
+
+    locations_sorted = sorted(df_valid["location_key"].astype(str).unique().tolist())
+    loc_to_id = {loc: i for i, loc in enumerate(locations_sorted)}
+    loc_ids_all = df_valid["location_key"].astype(str).map(loc_to_id).to_numpy(dtype=np.int64)
 
     train_idx, val_idx, test_idx = make_split_indices(df_valid, seed=seed, split_mode=split_mode)
 
     split = split_standardize(x_all, y_all, train_idx=train_idx, val_idx=val_idx, test_idx=test_idx)
 
-    train_ds = TabularDataset(split["x_train"], split["y_train"])
-    val_ds = TabularDataset(split["x_val"], split["y_val"])
+    loc_train = loc_ids_all[train_idx]
+    loc_val = loc_ids_all[val_idx]
+
+    train_ds = TabularDataset(split["x_train"], loc_train, split["y_train"])
+    val_ds = TabularDataset(split["x_val"], loc_val, split["y_val"])
     pin_memory = use_gpu and torch.cuda.is_available()
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
     device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
-    model = TabularMambaRegressor(num_features=split["x_train"].shape[1], d_model=d_model, n_layers=n_layers).to(device)
+    model = TabularMambaRegressor(
+        num_features=split["x_train"].shape[1],
+        num_locations=len(loc_to_id),
+        d_model=d_model,
+        n_layers=n_layers,
+    ).to(device)
 
     criterion = nn.HuberLoss(delta=1.0) if loss_name == "huber" else nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -359,11 +405,12 @@ def train_pipeline(
         epoch_start = time.time()
         optimizer.zero_grad(set_to_none=True)
 
-        for step, (xb, yb) in enumerate(train_loader, start=1):
+        for step, (xb, loc_ids, yb) in enumerate(train_loader, start=1):
             xb = xb.to(device)
+            loc_ids = loc_ids.to(device)
             yb = yb.to(device)
 
-            out = model(xb)
+            out = model(xb, loc_ids)
             loss = criterion(out, yb)
 
             if not torch.isfinite(loss):
@@ -432,41 +479,66 @@ def train_pipeline(
     if not isinstance(base_df, pd.DataFrame) or base_df.empty:
         raise ValueError("Không có dữ liệu test làm mốc để dự báo 24h tiếp theo.")
 
+    base_df = base_df.loc[base_df["location_key"].astype(str).isin(locations_sorted)].copy()
+    if base_df.empty:
+        raise ValueError("Test CSV không có location trùng với dữ liệu train đã chọn.")
+
     # 24h forecast after the last timestamp of each location in test base.
     future_df = build_future_24h_frame(base_df, feature_cols=feature_cols, target_col=target_col)
     x_future, _ = encode_selected_features(future_df, feature_cols)
     x_future = ((x_future - split["x_mean"]) / split["x_std"]).astype(np.float32)
 
-    future_ds = TabularDataset(x_future, np.zeros(len(x_future), dtype=np.float32))
+    loc_future = future_df["location_key"].astype(str).map(loc_to_id)
+    if loc_future.isna().any():
+        missing = sorted(future_df.loc[loc_future.isna(), "location_key"].astype(str).unique().tolist())
+        raise ValueError(f"Có location trong test không tồn tại trong train: {missing[:5]}")
+
+    future_ds = TabularDataset(
+        x_future,
+        loc_future.to_numpy(dtype=np.int64),
+        np.zeros(len(x_future), dtype=np.float32),
+    )
     future_loader = DataLoader(future_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=pin_memory)
 
     model.eval()
     future_preds = []
     with torch.no_grad():
-        for xb, _ in future_loader:
+        for xb, loc_ids, _ in future_loader:
             xb = xb.to(device)
-            out = model(xb)
+            loc_ids = loc_ids.to(device)
+            out = model(xb, loc_ids)
             future_preds.append(out.detach().cpu().numpy())
 
     future_preds = np.concatenate(future_preds, axis=0)
     future_preds = future_preds * split["y_std"] + split["y_mean"]
 
-    # Keep forecast output minimal and task-focused: time, location, predicted target.
+    # Keep forecast output minimal: generated hourly time + predicted target only.
     future_out = future_df[["ts_utc", "location_key"]].copy()
+    future_out = future_out.rename(columns={"ts_utc": "time"})
     future_out[f"{target_col}_pred"] = future_preds
-    future_out = future_out.sort_values(["location_key", "ts_utc"]).reset_index(drop=True)
+    future_out = future_out.sort_values(["location_key", "time"]).reset_index(drop=True)
 
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join("outputs", "streamlit_runs", run_id)
+    out_dir = run_dir
+    if out_dir is None:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = os.path.join("outputs", "streamlit_runs", run_id)
     os.makedirs(out_dir, exist_ok=True)
 
     model_path = os.path.join(out_dir, "best_mamba.pt")
     metrics_path = os.path.join(out_dir, "metrics_history.csv")
-    future_pred_path = os.path.join(out_dir, "future_24h_predictions.csv")
+    future_pred_path = os.path.join(out_dir, forecast_file_name)
 
     torch.save(model.state_dict(), model_path)
     pd.DataFrame(history).to_csv(metrics_path, index=False)
     future_out.to_csv(future_pred_path, index=False)
+
+    per_location_files = []
+    if export_per_location_files:
+        for loc in locations_sorted:
+            loc_df = future_out.loc[future_out["location_key"].astype(str) == loc, ["time", f"{target_col}_pred"]].copy()
+            loc_path = os.path.join(out_dir, f"future_24h_predictions_{sanitize_filename(loc)}.csv")
+            loc_df.to_csv(loc_path, index=False)
+            per_location_files.append(loc_path)
 
     summary = {
         "device": str(device),
@@ -484,7 +556,8 @@ def train_pipeline(
         "metrics_path": metrics_path,
         "future_pred_path": future_pred_path,
         "future_rows": len(future_out),
-        "future_locations": int(future_out["location_key"].nunique()) if "location_key" in future_out.columns else 0,
+        "future_locations": int(future_out["location_key"].nunique()),
+        "per_location_files": per_location_files,
         "run_sec": time.time() - start_all,
     }
     return summary, pd.DataFrame(history), future_out
@@ -533,10 +606,21 @@ def main():
         st.write(f"Columns: {df.shape[1]}")
 
     all_cols = df.columns.tolist()
+    if "location_key" not in df.columns:
+        st.error("Dataset cần có cột location_key để tách train/dự báo theo từng địa điểm.")
+        return
+
+    locations = sorted(df["location_key"].dropna().astype(str).unique().tolist())
+    if not locations:
+        st.error("Không tìm thấy location_key hợp lệ trong dataset.")
+        return
+
     reserved_cols = {"y_true", "y_pred", "abs_error"}
     feature_options = [
         c for c in all_cols
-        if c not in reserved_cols and not c.lower().startswith("unnamed:")
+        if c not in reserved_cols
+        and c not in ["ts_utc", "location_key"]
+        and not c.lower().startswith("unnamed:")
     ]
 
     st.subheader("Cấu hình train")
@@ -582,10 +666,23 @@ def main():
         help="time: chia theo thời gian (khuyến nghị khi muốn dự báo tương lai 24h).",
     )
 
+    selected_locations = st.multiselect(
+        "Chọn địa điểm để train + forecast riêng",
+        options=locations,
+        default=locations[:1],
+        help="Mặc định chọn 1 địa điểm. Bạn có thể chọn thêm nhiều địa điểm nếu muốn.",
+    )
+
     forecast_test_path = st.text_input(
         "Test CSV để làm mốc forecast +24h",
         value="dataset/test.csv",
         help="Ví dụ test là ngày 20 thì model sẽ dự báo ngày 21 theo từng location.",
+    )
+
+    export_per_location_files = st.checkbox(
+        "Xuất thêm file riêng từng location",
+        value=False,
+        help="Mặc định chỉ xuất 1 file tổng future_24h_predictions.csv có cột location_key.",
     )
 
     st.info("Tỉ lệ split cố định: Train 70% | Val 10% | Test 20%")
@@ -594,19 +691,37 @@ def main():
         if len(feature_cols) == 0:
             st.error("Bạn cần chọn ít nhất 1 cột input.")
             return
+        if len(selected_locations) == 0:
+            st.error("Bạn cần chọn ít nhất 1 location.")
+            return
 
         with st.spinner("Đang train và evaluate..."):
             try:
-                forecast_base_df = None
+                forecast_base_df_all = None
                 if forecast_test_path.strip():
                     if not os.path.exists(forecast_test_path):
                         st.error(f"Không tìm thấy file test: {forecast_test_path}")
                         return
-                    forecast_base_df = pd.read_csv(forecast_test_path)
+                    forecast_base_df_all = pd.read_csv(forecast_test_path)
+
+                run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                run_dir = os.path.join("outputs", "streamlit_runs", run_id)
+                os.makedirs(run_dir, exist_ok=True)
+
+                if forecast_base_df_all is not None and "location_key" not in forecast_base_df_all.columns:
+                    st.error("Test CSV cần có cột location_key để lọc theo địa điểm.")
+                    return
+
+                forecast_base_df = forecast_base_df_all
+                if forecast_base_df is not None:
+                    forecast_base_df = forecast_base_df.loc[
+                        forecast_base_df["location_key"].astype(str).isin([str(x) for x in selected_locations])
+                    ].copy()
 
                 summary, hist_df, future_df = train_pipeline(
                     df=df,
                     forecast_base_df=forecast_base_df,
+                    selected_locations=selected_locations,
                     target_col=target_col,
                     feature_cols=feature_cols,
                     epochs=int(epochs),
@@ -623,7 +738,31 @@ def main():
                     grad_accum_steps=int(grad_accum_steps),
                     max_grad_norm=float(max_grad_norm),
                     split_mode=split_mode,
+                    run_dir=run_dir,
+                    export_per_location_files=bool(export_per_location_files),
                 )
+
+                summary_df = pd.DataFrame([summary])
+
+                train_counts = (
+                    df.loc[df["location_key"].astype(str).isin([str(x) for x in selected_locations]), "location_key"]
+                    .astype(str)
+                    .value_counts()
+                    .rename_axis("location_key")
+                    .reset_index(name="train_source_rows")
+                )
+                if forecast_base_df is not None and not forecast_base_df.empty:
+                    test_counts = (
+                        forecast_base_df["location_key"].astype(str).value_counts().rename_axis("location_key").reset_index(name="test_source_rows")
+                    )
+                else:
+                    test_counts = pd.DataFrame({"location_key": selected_locations, "test_source_rows": [0] * len(selected_locations)})
+
+                used_counts = (
+                    future_df["location_key"].astype(str).value_counts().rename_axis("location_key").reset_index(name="future_rows")
+                )
+                stats_df = train_counts.merge(test_counts, on="location_key", how="outer").merge(used_counts, on="location_key", how="outer")
+                stats_df = stats_df.fillna(0)
             except Exception as e:
                 st.error(f"Train/Test lỗi: {e}")
                 return
@@ -634,15 +773,31 @@ def main():
         met1.metric("Val MAE", f"{summary['val_mae']:.4f}")
         met2.metric("Val RMSE", f"{summary['val_rmse']:.4f}")
         met3.metric("Val R2", f"{summary['val_r2']:.4f}")
-        met4.metric("Rows used", f"{summary['n_rows_used']:,}")
+        met4.metric("Locations done", f"{int(summary['future_locations']):,}")
+
+        st.write("### Số dòng sau khi lọc theo địa điểm")
+        merged_stats = stats_df.merge(
+            pd.DataFrame(
+                [
+                    {
+                        "n_rows_used": summary["n_rows_used"],
+                        "split_train": summary["split_train"],
+                        "split_val": summary["split_val"],
+                        "split_test": summary["split_test"],
+                    }
+                ]
+            ),
+            how="cross",
+        )
+        st.dataframe(merged_stats, use_container_width=True)
 
         st.write("### Thống kê split")
         st.write(
             {
-                "train": summary["split_train"],
-                "val": summary["split_val"],
-                "test": summary["split_test"],
-                "device": summary["device"],
+                "split_train": summary["split_train"],
+                "split_val": summary["split_val"],
+                "split_test": summary["split_test"],
+                "n_rows_used": summary["n_rows_used"],
                 "future_rows": summary["future_rows"],
                 "future_locations": summary["future_locations"],
                 "run_sec": round(summary["run_sec"], 2),
@@ -652,22 +807,28 @@ def main():
         st.write("### Lịch sử train")
         st.dataframe(hist_df, use_container_width=True)
 
-        st.write("### Dự báo 24 giờ tiếp theo (mọi địa điểm)")
+        st.write("### Dự báo 24 giờ tiếp theo (từng địa điểm)")
         st.dataframe(future_df.head(300), use_container_width=True)
-
         st.download_button(
-            "Download future 24h predictions CSV",
+            "Download file tổng (mọi location)",
             data=future_df.to_csv(index=False).encode("utf-8"),
             file_name="future_24h_predictions.csv",
             mime="text/csv",
         )
 
+        if export_per_location_files:
+            st.info("Đã xuất thêm file riêng cho từng location trong thư mục run, ví dụ: future_24h_predictions_hcm.csv")
+        else:
+            st.info("Đang dùng chế độ file tổng: future_24h_predictions.csv (có cột location_key).")
+        if summary.get("per_location_files"):
+            st.write("### Các file đã xuất")
+            st.dataframe(pd.DataFrame({"file": summary["per_location_files"]}), use_container_width=True)
+
         st.code(
             "\n".join(
                 [
-                    f"model_path: {summary['model_path']}",
-                    f"metrics_path: {summary['metrics_path']}",
-                    f"future_pred_path: {summary['future_pred_path']}",
+                    f"run_dir: {os.path.dirname(summary['future_pred_path'])}",
+                    "Files: future_24h_predictions_<location>.csv",
                 ]
             )
         )
