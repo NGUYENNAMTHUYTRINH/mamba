@@ -176,6 +176,43 @@ def build_time_series_samples(df: pd.DataFrame, target_col: str, window_size: in
     return x_seq, loc_ids, y, y_ts, num_locations, numeric_cols
 
 
+class TimeSeriesMambaRegressorNoLoc(nn.Module):
+    """Variant of the model that does NOT use a learned location token.
+    Use when training on a single location (filtering the dataframe first).
+    The forward signature keeps `loc_ids` for compatibility with existing loaders.
+    """
+    def __init__(self, num_features: int, d_model: int = 64, n_layers: int = 2):
+        super().__init__()
+        self.feature_proj = nn.Linear(num_features, d_model)
+        self.layers = nn.ModuleList(
+            [
+                Mamba(
+                    d_model=d_model,
+                    d_state=16,
+                    d_conv=4,
+                    expand=2,
+                    use_fast_path=False,
+                )
+                for _ in range(n_layers)
+            ]
+        )
+        self.norm = nn.LayerNorm(d_model)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
+
+    def forward(self, x_seq: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
+        # x_seq: (B, T, F)
+        x = self.feature_proj(x_seq)  # (B, T, d_model)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        last_token = x[:, -1, :]
+        return self.head(last_token).squeeze(-1)
+
+
 def split_data_by_timeline(
     x_seq: np.ndarray,
     loc_ids: np.ndarray,
@@ -354,6 +391,7 @@ def main():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--out-dir", type=str, default="outputs")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu", "auto"])
+    parser.add_argument("--location", type=str, default=None, help="If set, filter data to this location_key and train without location embedding")
     parser.add_argument("--log-interval", type=int, default=50)
     parser.add_argument("--loss", type=str, default="huber", choices=["mse", "huber"])
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision (recommended on CUDA)")
@@ -370,6 +408,16 @@ def main():
     logger.info("Loading dataset from: %s", args.data_path)
     df = pd.read_csv(args.data_path)
     logger.info("Total rows loaded: %d", len(df))
+
+    # If user requested single-location mode, filter data early so we build samples only for that location
+    if args.location is not None:
+        loc_str = str(args.location)
+        if "location_key" not in df.columns:
+            raise ValueError("--location specified but dataset has no 'location_key' column")
+        df = df[df["location_key"].astype(str) == loc_str].copy()
+        if df.empty:
+            raise ValueError(f"No rows found for location '{loc_str}' in dataset")
+        logger.info("Filtered dataset to location=%s, rows now: %d", loc_str, len(df))
 
     x_seq, loc_ids, y, y_ts, num_locations, feature_cols = build_time_series_samples(
         df=df,
@@ -424,12 +472,20 @@ def main():
     logger.info("AMP enabled: %s", use_amp)
     logger.info("Gradient accumulation steps: %d", args.grad_accum_steps)
 
-    model = TimeSeriesMambaRegressor(
-        num_features=train.x_seq.shape[-1],
-        num_locations=num_locations,
-        d_model=args.d_model,
-        n_layers=args.n_layers,
-    ).to(device)
+    if args.location is not None:
+        # single-location mode: use model variant without location embedding
+        model = TimeSeriesMambaRegressorNoLoc(
+            num_features=train.x_seq.shape[-1],
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+        ).to(device)
+    else:
+        model = TimeSeriesMambaRegressor(
+            num_features=train.x_seq.shape[-1],
+            num_locations=num_locations,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+        ).to(device)
 
     criterion = nn.HuberLoss(delta=1.0) if args.loss == "huber" else nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

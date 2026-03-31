@@ -12,6 +12,22 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 
 from mamba_ssm import Mamba
+import importlib.util
+from pathlib import Path
+
+
+def _load_train_module():
+    """Dynamically load scripts/train_mamba_aqi.py and return the module.
+    This avoids package import issues when running Streamlit.
+    """
+    try:
+        mod_path = Path(__file__).parent / "scripts" / "train_mamba_aqi.py"
+        spec = importlib.util.spec_from_file_location("train_mamba_aqi_for_streamlit", str(mod_path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
 
 
 class TabularDataset(Dataset):
@@ -530,10 +546,18 @@ def train_pipeline(
 
     torch.save(model.state_dict(), model_path)
     pd.DataFrame(history).to_csv(metrics_path, index=False)
-    future_out.to_csv(future_pred_path, index=False)
+    # Do NOT write the combined `future_24h_predictions.csv` file; produce per-location files only.
+    # If an old combined file exists in the output dir (from previous runs), remove it.
+    if os.path.exists(future_pred_path):
+        try:
+            os.remove(future_pred_path)
+        except Exception:
+            pass
 
+    # Always emit per-location CSVs (time + prediction only) alongside the combined file.
+    # This produces files like future_24h_predictions_<location>.csv without the `location_key` column.
     per_location_files = []
-    if export_per_location_files:
+    if "location_key" in future_out.columns:
         for loc in locations_sorted:
             loc_df = future_out.loc[future_out["location_key"].astype(str) == loc, ["time", f"{target_col}_pred"]].copy()
             loc_path = os.path.join(out_dir, f"future_24h_predictions_{sanitize_filename(loc)}.csv")
@@ -623,6 +647,50 @@ def main():
         and not c.lower().startswith("unnamed:")
     ]
 
+    # LOCATION selector first: choose locations, preview counts/splits, then show train config
+    st.subheader("Chọn địa điểm để train + forecast riêng (trước khi cấu hình)")
+    # Restrict to single location selection for per-location training
+    selected_location = st.selectbox(
+        "Chọn địa điểm để train + forecast riêng",
+        options=locations,
+        index=0,
+        help="Chọn 1 địa điểm để train và forecast riêng cho tỉnh/thành đó.",
+    )
+    selected_locations = [selected_location]
+
+    # quick window/horizon preview inputs used to estimate sample counts
+    preview_col1, preview_col2 = st.columns([1, 1])
+    with preview_col1:
+        preview_window = st.number_input("Preview window size (timesteps)", min_value=1, max_value=168, value=24, step=1)
+    with preview_col2:
+        preview_horizon = st.number_input("Preview horizon", min_value=1, max_value=168, value=1, step=1)
+
+    # show counts for selected locations using default target 'aqi' if available
+    if selected_locations:
+        try:
+            df_sel = df.loc[df["location_key"].astype(str).isin([str(x) for x in selected_locations])].copy()
+            # choose a reasonable default target for preview
+            default_target = "aqi" if "aqi" in df_sel.columns else next((c for c in df_sel.select_dtypes(include=["number"]).columns if c not in ["_loc_id"]), None)
+            if default_target is None:
+                st.warning("Không tìm thấy cột số nào để preview sample counts. Cấu hình train sẽ yêu cầu chọn target.")
+            else:
+                mod = _load_train_module()
+                if mod is None or not hasattr(mod, "build_time_series_samples"):
+                    st.warning("Không thể load helper 'build_time_series_samples' để preview samples.")
+                else:
+                    x_seq, loc_ids, y, y_ts, num_locations, feature_cols = mod.build_time_series_samples(
+                        df_sel, default_target, int(preview_window), int(preview_horizon)
+                    )
+                    # Use split function from loaded module when available
+                    if hasattr(mod, "split_data_by_timeline"):
+                        train, val, test = mod.split_data_by_timeline(x_seq, loc_ids, y, y_ts)
+                    else:
+                        train, val, test = split_data_by_timeline(x_seq, loc_ids, y, y_ts)
+                    st.markdown(f"**Preview (1 location)**: total samples={len(y):,}")
+                    st.write(f"Train: {len(train.y):,}  |  Val: {len(val.y):,}  |  Test: {len(test.y):,}")
+        except Exception as e:
+            st.warning(f"Không thể tính preview samples: {e}")
+
     st.subheader("Cấu hình train")
     conf1, conf2, conf3 = st.columns(3)
     with conf1:
@@ -664,13 +732,6 @@ def main():
         options=["time", "random"],
         index=0,
         help="time: chia theo thời gian (khuyến nghị khi muốn dự báo tương lai 24h).",
-    )
-
-    selected_locations = st.multiselect(
-        "Chọn địa điểm để train + forecast riêng",
-        options=locations,
-        default=locations[:1],
-        help="Mặc định chọn 1 địa điểm. Bạn có thể chọn thêm nhiều địa điểm nếu muốn.",
     )
 
     forecast_test_path = st.text_input(

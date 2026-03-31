@@ -1,0 +1,25 @@
+# Environment notes (from current machine)
+# Python: 3.11.9
+# NVIDIA Driver: 512.74
+# CUDA Driver Runtime (nvidia-smi): 11.6
+# PyTorch build: 2.7.1+cu118 (CUDA 11.8)
+# torch.cuda.is_available(): True
+# GPU: NVIDIA GeForce RTX 3050 Laptop GPU
+
+# Use the PyTorch cu118 wheel index for +cu118 builds
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+torch==2.7.1+cu118
+
+einops==0.8.2
+transformers==5.3.0
+ninja==1.13.0
+pandas==2.3.3
+scikit-learn==1.8.0
+pytest==9.0.2
+tqdm==4.67.3
+streamlit==1.55.0
+
+# Installed package name is mamba_ssm (distribution mamba-ssm)
+mamba-ssm==2.3.1
+
