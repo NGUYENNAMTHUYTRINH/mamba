@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from torch.utils.data import DataLoader
 
@@ -249,6 +250,17 @@ def _safe_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(mape)
 
 
+class HybridRegLoss(nn.Module):
+    def __init__(self, mae_weight: float = 0.8):
+        super().__init__()
+        self.mae_weight = float(mae_weight)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        l1 = F.l1_loss(pred, target)
+        mse = F.mse_loss(pred, target)
+        return self.mae_weight * l1 + (1.0 - self.mae_weight) * mse
+
+
 def _predict_future_from_rows_tft(
     model,
     combined_df: pd.DataFrame,
@@ -394,7 +406,14 @@ def train_pipeline(
         target_feature_idx=target_feature_idx,
     ).to(device)
 
-    criterion = nn.HuberLoss(delta=1.0) if loss_name == "huber" else nn.MSELoss()
+    if loss_name == "huber":
+        criterion = nn.HuberLoss(delta=1.0)
+    elif loss_name == "mse":
+        criterion = nn.MSELoss()
+    elif loss_name == "mae":
+        criterion = nn.L1Loss()
+    else:
+        criterion = HybridRegLoss(mae_weight=0.8)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     total_steps = max(1, epochs * max(1, len(train_loader)))
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -409,9 +428,10 @@ def train_pipeline(
     amp_enabled = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
-    best_val_loss = float("inf")
+    best_val_score = float("inf")
     best_state = None
     history = []
+    best_metric_name = "mae" if loss_name in {"mae", "hybrid"} else "loss"
 
     total_steps = epochs * len(train_loader)
     global_step = 0
@@ -497,8 +517,9 @@ def train_pipeline(
             }
         )
 
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
+        current_score = float(val_metrics[best_metric_name])
+        if current_score < best_val_score:
+            best_val_score = current_score
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     if best_state is None:
@@ -883,6 +904,14 @@ def main():
         help="Chọn 1 địa điểm để train và forecast riêng cho tỉnh/thành đó.",
     )
     selected_locations = [selected_location]
+    train_mode = st.radio(
+        "Train model",
+        options=["Mamba", "Transformer_TFT", "Cả 2 (so sánh)"],
+        index=2,
+        horizontal=True,
+    )
+    run_mamba = train_mode in ["Mamba", "Cả 2 (so sánh)"]
+    run_transformer = train_mode in ["Transformer_TFT", "Cả 2 (so sánh)"]
 
     # quick window/horizon preview inputs used to estimate sample counts
     preview_col1, preview_col2 = st.columns([1, 1])
@@ -943,7 +972,7 @@ def main():
             value=True,
             help="Bật để model học phần chênh lệch từ giá trị target gần nhất.",
         )
-        loss_name = st.selectbox("Loss", options=["huber", "mse"], index=0)
+        loss_name = st.selectbox("Loss", options=["hybrid", "mae", "huber", "mse"], index=0)
 
     with conf2:
         window_size = st.number_input("Window size (T)", min_value=1, max_value=168, value=24, step=1)
@@ -958,6 +987,11 @@ def main():
         n_layers = st.number_input("n_layers", min_value=1, max_value=8, value=2, step=1)
         grad_accum_steps = st.number_input("Gradient accumulation", min_value=1, max_value=64, value=2, step=1)
         max_grad_norm = st.number_input("Max grad norm", min_value=0.0, max_value=100.0, value=1.0, step=0.5)
+        mamba_speed_mode = st.checkbox(
+            "Mamba speed mode (x2 batch, no accumulation)",
+            value=True,
+            help="Tăng tốc Mamba bằng batch lớn hơn và bỏ gradient accumulation.",
+        )
 
     run1, run2, run3 = st.columns(3)
     with run1:
@@ -972,6 +1006,18 @@ def main():
         "Không dùng file test.csv riêng; test là các mốc thời gian gần nhất trong dataset tổng. "
         "Model train theo time-series B,T,F (single-location, no-embedding)."
     )
+
+    mamba_batch_size = int(min(8192, int(batch_size) * (2 if mamba_speed_mode else 1)))
+    mamba_grad_accum_steps = 1 if mamba_speed_mode else int(grad_accum_steps)
+    if run_mamba and run_transformer:
+        st.caption(
+            f"Mamba runtime config: batch={mamba_batch_size}, grad_accum={mamba_grad_accum_steps}. "
+            f"Transformer batch={int(batch_size)}"
+        )
+    elif run_mamba:
+        st.caption(f"Mamba runtime config: batch={mamba_batch_size}, grad_accum={mamba_grad_accum_steps}")
+    else:
+        st.caption(f"Transformer runtime config: batch={int(batch_size)}")
 
     if st.button("Train & Test", type="primary"):
         if len(selected_locations) == 0:
@@ -992,50 +1038,62 @@ def main():
                 # Use internal 20% latest-time split as test base (no external test.csv).
                 forecast_base_df = None
 
-                summary, hist_df, future_df = train_pipeline(
-                    df=df,
-                    forecast_base_df=forecast_base_df,
-                    selected_locations=selected_locations,
-                    target_col=target_col,
-                    window_size=int(window_size),
-                    horizon=int(horizon),
-                    epochs=int(epochs),
-                    batch_size=int(batch_size),
-                    lr=float(lr),
-                    weight_decay=float(weight_decay),
-                    d_model=int(d_model),
-                    n_layers=int(n_layers),
-                    loss_name=loss_name,
-                    seed=int(seed),
-                    num_workers=int(num_workers),
-                    use_gpu=bool(use_gpu),
-                    log_interval=0,
-                    grad_accum_steps=int(grad_accum_steps),
-                    max_grad_norm=float(max_grad_norm),
-                    input_feature_cols=selected_input_cols,
-                    include_target_history=bool(include_target_history),
-                    run_dir=run_dir,
-                )
+                summary = None
+                hist_df = None
+                future_df = None
+                t_summary = None
+                t_hist_df = None
+                t_future_df = None
 
-                t_summary, t_hist_df, t_future_df = train_transformer_pipeline(
-                    df=df,
-                    selected_locations=selected_locations,
-                    target_col=target_col,
-                    window_size=int(window_size),
-                    horizon=int(horizon),
-                    epochs=int(epochs),
-                    batch_size=int(batch_size),
-                    lr=float(lr),
-                    d_model=int(d_model),
-                    seed=int(seed),
-                    num_workers=int(num_workers),
-                    use_gpu=bool(use_gpu),
-                    run_dir=transformer_run_dir,
-                    input_feature_cols=selected_input_cols,
-                    include_target_history=bool(include_target_history),
-                )
+                if run_mamba:
+                    summary, hist_df, future_df = train_pipeline(
+                        df=df,
+                        forecast_base_df=forecast_base_df,
+                        selected_locations=selected_locations,
+                        target_col=target_col,
+                        window_size=int(window_size),
+                        horizon=int(horizon),
+                        epochs=int(epochs),
+                        batch_size=mamba_batch_size,
+                        lr=float(lr),
+                        weight_decay=float(weight_decay),
+                        d_model=int(d_model),
+                        n_layers=int(n_layers),
+                        loss_name=loss_name,
+                        seed=int(seed),
+                        num_workers=int(num_workers),
+                        use_gpu=bool(use_gpu),
+                        log_interval=0,
+                        grad_accum_steps=mamba_grad_accum_steps,
+                        max_grad_norm=float(max_grad_norm),
+                        input_feature_cols=selected_input_cols,
+                        include_target_history=bool(include_target_history),
+                        run_dir=run_dir,
+                    )
 
-                summary_df = pd.DataFrame([summary])
+                if run_transformer:
+                    t_summary, t_hist_df, t_future_df = train_transformer_pipeline(
+                        df=df,
+                        selected_locations=selected_locations,
+                        target_col=target_col,
+                        window_size=int(window_size),
+                        horizon=int(horizon),
+                        epochs=int(epochs),
+                        batch_size=int(batch_size),
+                        lr=float(lr),
+                        d_model=int(d_model),
+                        seed=int(seed),
+                        num_workers=int(num_workers),
+                        use_gpu=bool(use_gpu),
+                        run_dir=transformer_run_dir,
+                        input_feature_cols=selected_input_cols,
+                        include_target_history=bool(include_target_history),
+                    )
+
+                active_summary = summary if summary is not None else t_summary
+                active_future_df = future_df if future_df is not None else t_future_df
+                if active_summary is None or active_future_df is None:
+                    raise RuntimeError("Không có kết quả train hợp lệ.")
 
                 train_counts = (
                     df.loc[df["location_key"].astype(str).isin([str(x) for x in selected_locations]), "location_key"]
@@ -1047,12 +1105,12 @@ def main():
                 test_counts = pd.DataFrame(
                     {
                         "location_key": selected_locations,
-                        "test_source_rows": [int(summary["split_test"])],
+                        "test_source_rows": [int(active_summary["split_test"])],
                     }
                 )
 
                 used_counts = (
-                    future_df["location_key"].astype(str).value_counts().rename_axis("location_key").reset_index(name="future_rows")
+                    active_future_df["location_key"].astype(str).value_counts().rename_axis("location_key").reset_index(name="future_rows")
                 )
                 stats_df = train_counts.merge(test_counts, on="location_key", how="outer").merge(used_counts, on="location_key", how="outer")
                 stats_df = stats_df.fillna(0)
@@ -1063,67 +1121,111 @@ def main():
         st.success("Train/Test hoàn tất")
 
         met1, met2, met3, met4 = st.columns(4)
-        met1.metric("Val MAE", f"{summary['val_mae']:.4f}")
-        met2.metric("Val RMSE", f"{summary['val_rmse']:.4f}")
-        met3.metric("Val R2", f"{summary['val_r2']:.4f}")
-        met4.metric("Locations done", f"{int(summary['future_locations']):,}")
+        met1.metric("Val MAE", f"{active_summary['val_mae']:.4f}")
+        met2.metric("Val RMSE", f"{active_summary['val_rmse']:.4f}")
+        met3.metric("Val R2", f"{active_summary['val_r2']:.4f}")
+        met4.metric("Locations done", f"{int(active_summary['future_locations']):,}")
 
-        st.write("### So sánh Mamba vs Transformer (TFT)")
-        compare_df = pd.DataFrame(
-            [
-                {
-                    "model": "Mamba",
-                    "train_total_sec": summary["run_sec"],
-                    "sec_per_epoch": summary["sec_per_epoch"],
-                    "val_mae": summary["val_mae"],
-                    "val_mse": summary["val_mse"],
-                    "val_rmse": summary["val_rmse"],
-                    "val_r2": summary["val_r2"],
-                    "val_mape": summary["val_mape"],
-                    "test_mae": summary["test_mae"],
-                    "test_mse": summary["test_mse"],
-                    "test_rmse": summary["test_rmse"],
-                    "test_r2": summary["test_r2"],
-                    "test_mape": summary["test_mape"],
-                },
-                {
-                    "model": "Transformer_TFT",
-                    "train_total_sec": t_summary["run_sec"],
-                    "sec_per_epoch": t_summary["sec_per_epoch"],
-                    "val_mae": t_summary["val_mae"],
-                    "val_mse": t_summary["val_mse"],
-                    "val_rmse": t_summary["val_rmse"],
-                    "val_r2": t_summary["val_r2"],
-                    "val_mape": t_summary["val_mape"],
-                    "test_mae": t_summary["test_mae"],
-                    "test_mse": t_summary["test_mse"],
-                    "test_rmse": t_summary["test_rmse"],
-                    "test_r2": t_summary["test_r2"],
-                    "test_mape": t_summary["test_mape"],
-                },
-            ]
-        )
-        st.dataframe(compare_df, use_container_width=True)
+        if run_mamba and run_transformer:
+            st.write("### So sánh Mamba vs Transformer (TFT)")
+            compare_df = pd.DataFrame(
+                [
+                    {
+                        "model": "Mamba",
+                        "train_total_sec": summary["run_sec"],
+                        "sec_per_epoch": summary["sec_per_epoch"],
+                        "val_mae": summary["val_mae"],
+                        "val_mse": summary["val_mse"],
+                        "val_rmse": summary["val_rmse"],
+                        "val_r2": summary["val_r2"],
+                        "val_mape": summary["val_mape"],
+                        "test_mae": summary["test_mae"],
+                        "test_mse": summary["test_mse"],
+                        "test_rmse": summary["test_rmse"],
+                        "test_r2": summary["test_r2"],
+                        "test_mape": summary["test_mape"],
+                    },
+                    {
+                        "model": "Transformer_TFT",
+                        "train_total_sec": t_summary["run_sec"],
+                        "sec_per_epoch": t_summary["sec_per_epoch"],
+                        "val_mae": t_summary["val_mae"],
+                        "val_mse": t_summary["val_mse"],
+                        "val_rmse": t_summary["val_rmse"],
+                        "val_r2": t_summary["val_r2"],
+                        "val_mape": t_summary["val_mape"],
+                        "test_mae": t_summary["test_mae"],
+                        "test_mse": t_summary["test_mse"],
+                        "test_rmse": t_summary["test_rmse"],
+                        "test_r2": t_summary["test_r2"],
+                        "test_mape": t_summary["test_mape"],
+                    },
+                ]
+            )
+            st.dataframe(compare_df, use_container_width=True)
 
-        # Quick winner cards for speed and accuracy
-        faster_model = "Mamba" if summary["run_sec"] <= t_summary["run_sec"] else "Transformer_TFT"
-        better_mae_model = "Mamba" if summary["test_mae"] <= t_summary["test_mae"] else "Transformer_TFT"
-        better_mse_model = "Mamba" if summary["test_mse"] <= t_summary["test_mse"] else "Transformer_TFT"
+            faster_model = "Mamba" if summary["run_sec"] <= t_summary["run_sec"] else "Transformer_TFT"
+            better_mae_model = "Mamba" if summary["test_mae"] <= t_summary["test_mae"] else "Transformer_TFT"
+            better_mse_model = "Mamba" if summary["test_mse"] <= t_summary["test_mse"] else "Transformer_TFT"
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Faster model", faster_model, f"Mamba: {summary['run_sec']:.2f}s | TFT: {t_summary['run_sec']:.2f}s")
-        c2.metric("Best Test MAE", better_mae_model, f"Mamba: {summary['test_mae']:.4f} | TFT: {t_summary['test_mae']:.4f}")
-        c3.metric("Best Test MSE", better_mse_model, f"Mamba: {summary['test_mse']:.4f} | TFT: {t_summary['test_mse']:.4f}")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Faster model", faster_model, f"Mamba: {summary['run_sec']:.2f}s | TFT: {t_summary['run_sec']:.2f}s")
+            c2.metric("Best Test MAE", better_mae_model, f"Mamba: {summary['test_mae']:.4f} | TFT: {t_summary['test_mae']:.4f}")
+            c3.metric("Best Test MSE", better_mse_model, f"Mamba: {summary['test_mse']:.4f} | TFT: {t_summary['test_mse']:.4f}")
+
+            st.write("### Kết luận tổng quan")
+            decision_mode = st.radio(
+                "Ưu tiên đánh giá",
+                options=["MAE", "MSE", "Tốc độ", "Cân bằng"],
+                index=3,
+                horizontal=True,
+                key="decision_mode",
+            )
+
+            if decision_mode == "MAE":
+                overall_winner = better_mae_model
+                decision_reason = "Ưu tiên sai số tuyệt đối thấp nhất trên test (MAE)."
+            elif decision_mode == "MSE":
+                overall_winner = better_mse_model
+                decision_reason = "Ưu tiên bình phương sai số thấp nhất trên test (MSE)."
+            elif decision_mode == "Tốc độ":
+                overall_winner = faster_model
+                decision_reason = "Ưu tiên thời gian train tổng nhanh hơn."
+            else:
+                eps = 1e-8
+                best_mae = min(summary["test_mae"], t_summary["test_mae"])
+                best_mse = min(summary["test_mse"], t_summary["test_mse"])
+                best_sec = min(summary["run_sec"], t_summary["run_sec"])
+
+                # Higher is better after normalization.
+                mamba_score = (
+                    0.5 * (best_mae / (summary["test_mae"] + eps))
+                    + 0.3 * (best_mse / (summary["test_mse"] + eps))
+                    + 0.2 * (best_sec / (summary["run_sec"] + eps))
+                )
+                tft_score = (
+                    0.5 * (best_mae / (t_summary["test_mae"] + eps))
+                    + 0.3 * (best_mse / (t_summary["test_mse"] + eps))
+                    + 0.2 * (best_sec / (t_summary["run_sec"] + eps))
+                )
+                overall_winner = "Mamba" if mamba_score >= tft_score else "Transformer_TFT"
+                decision_reason = (
+                    "Chế độ cân bằng dùng điểm tổng hợp: 50% MAE, 30% MSE, 20% tốc độ. "
+                    f"(Mamba={mamba_score:.4f}, TFT={tft_score:.4f})"
+                )
+
+            st.success(f"Kết luận: {overall_winner} phù hợp hơn theo tiêu chí '{decision_mode}'.")
+            st.caption(decision_reason)
 
         st.write("### Số dòng sau khi lọc theo địa điểm")
         merged_stats = stats_df.merge(
             pd.DataFrame(
                 [
                     {
-                        "n_rows_used": summary["n_rows_used"],
-                        "split_train": summary["split_train"],
-                        "split_val": summary["split_val"],
-                        "split_test": summary["split_test"],
+                        "n_rows_used": active_summary["n_rows_used"],
+                        "split_train": active_summary["split_train"],
+                        "split_val": active_summary["split_val"],
+                        "split_test": active_summary["split_test"],
                     }
                 ]
             ),
@@ -1134,52 +1236,59 @@ def main():
         st.write("### Thống kê split")
         st.write(
             {
-                "split_train": summary["split_train"],
-                "split_val": summary["split_val"],
-                "split_test": summary["split_test"],
-                "n_rows_used": summary["n_rows_used"],
-                "future_rows": summary["future_rows"],
-                "future_locations": summary["future_locations"],
-                "run_sec": round(summary["run_sec"], 2),
+                "split_train": active_summary["split_train"],
+                "split_val": active_summary["split_val"],
+                "split_test": active_summary["split_test"],
+                "n_rows_used": active_summary["n_rows_used"],
+                "future_rows": active_summary["future_rows"],
+                "future_locations": active_summary["future_locations"],
+                "run_sec": round(active_summary["run_sec"], 2),
             }
         )
 
-        st.write("### Lịch sử train")
-        st.dataframe(hist_df, use_container_width=True)
-
-        st.write("### Lịch sử train - Transformer (TFT)")
-        st.dataframe(t_hist_df, use_container_width=True)
-
-        st.write("### Dự báo 24 giờ tiếp theo (từng địa điểm)")
-        st.dataframe(future_df.head(300), use_container_width=True)
-        st.download_button(
-            "Download file tổng (mọi location)",
-            data=future_df.to_csv(index=False).encode("utf-8"),
-            file_name="future_24h_predictions.csv",
-            mime="text/csv",
-        )
-
-        st.info("Đã xuất file riêng cho location đã chọn trong thư mục run, ví dụ: future_24h_predictions_hcm.csv")
-        if summary.get("per_location_files"):
-            st.write("### Các file đã xuất")
-            st.dataframe(pd.DataFrame({"file": summary["per_location_files"]}), use_container_width=True)
-
-        st.write("### Dự báo 24 giờ tiếp theo - Transformer (TFT)")
-        st.dataframe(t_future_df.head(300), use_container_width=True)
-        if t_summary.get("per_location_files"):
-            st.write("### Các file Transformer đã xuất")
-            st.dataframe(pd.DataFrame({"file": t_summary["per_location_files"]}), use_container_width=True)
-
-        st.code(
-            "\n".join(
-                [
-                    f"run_dir: {os.path.dirname(summary['future_pred_path'])}",
-                    "Files: future_24h_predictions_<location>.csv",
-                    f"transformer_run_dir: {transformer_run_dir}",
-                    "Files: future_24h_predictions_transformer_<location>.csv",
-                ]
+        if run_mamba and hist_df is not None:
+            st.write("### Lịch sử train - Mamba")
+            st.dataframe(hist_df, use_container_width=True)
+            st.write("### Dự báo 24 giờ tiếp theo - Mamba")
+            st.dataframe(future_df.head(300), use_container_width=True)
+            st.download_button(
+                "Download dự báo Mamba",
+                data=future_df.to_csv(index=False).encode("utf-8"),
+                file_name="future_24h_predictions_mamba.csv",
+                mime="text/csv",
             )
-        )
+            if summary.get("per_location_files"):
+                st.write("### Các file Mamba đã xuất")
+                st.dataframe(pd.DataFrame({"file": summary["per_location_files"]}), use_container_width=True)
+
+        if run_transformer and t_hist_df is not None:
+            st.write("### Lịch sử train - Transformer (TFT)")
+            st.dataframe(t_hist_df, use_container_width=True)
+            st.write("### Dự báo 24 giờ tiếp theo - Transformer (TFT)")
+            st.dataframe(t_future_df.head(300), use_container_width=True)
+            st.download_button(
+                "Download dự báo Transformer",
+                data=t_future_df.to_csv(index=False).encode("utf-8"),
+                file_name="future_24h_predictions_transformer.csv",
+                mime="text/csv",
+            )
+            if t_summary.get("per_location_files"):
+                st.write("### Các file Transformer đã xuất")
+                st.dataframe(pd.DataFrame({"file": t_summary["per_location_files"]}), use_container_width=True)
+
+        code_lines = []
+        if run_mamba and summary is not None:
+            code_lines.extend([
+                f"run_dir: {os.path.dirname(summary['future_pred_path'])}",
+                "Files: future_24h_predictions_<location>.csv",
+            ])
+        if run_transformer and t_summary is not None:
+            code_lines.extend([
+                f"transformer_run_dir: {transformer_run_dir}",
+                "Files: future_24h_predictions_transformer_<location>.csv",
+            ])
+        if code_lines:
+            st.code("\n".join(code_lines))
 
 
 if __name__ == "__main__":

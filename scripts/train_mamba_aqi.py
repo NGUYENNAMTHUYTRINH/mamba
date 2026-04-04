@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -108,6 +109,17 @@ def setup_logger(out_dir: str):
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     return logger
+
+
+class HybridRegLoss(nn.Module):
+    def __init__(self, mae_weight: float = 0.8):
+        super().__init__()
+        self.mae_weight = float(mae_weight)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        l1 = F.l1_loss(pred, target)
+        mse = F.mse_loss(pred, target)
+        return self.mae_weight * l1 + (1.0 - self.mae_weight) * mse
 
 
 def resolve_device(device_arg: str):
@@ -448,7 +460,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu", "auto"])
     parser.add_argument("--location", type=str, default=None, help="If set, filter data to this location_key and train without location embedding")
     parser.add_argument("--log-interval", type=int, default=50)
-    parser.add_argument("--loss", type=str, default="huber", choices=["mse", "huber"])
+    parser.add_argument("--loss", type=str, default="hybrid", choices=["mse", "huber", "mae", "hybrid"])
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision (recommended on CUDA)")
     parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -545,11 +557,19 @@ def main():
             target_feature_idx=target_feature_idx,
         ).to(device)
 
-    criterion = nn.HuberLoss(delta=1.0) if args.loss == "huber" else nn.MSELoss()
+    if args.loss == "huber":
+        criterion = nn.HuberLoss(delta=1.0)
+    elif args.loss == "mse":
+        criterion = nn.MSELoss()
+    elif args.loss == "mae":
+        criterion = nn.L1Loss()
+    else:
+        criterion = HybridRegLoss(mae_weight=0.8)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    best_val_loss = float("inf")
+    best_val_score = float("inf")
     best_path = os.path.join(args.out_dir, "best_mamba_aqi.pt")
+    best_metric_name = "mae" if args.loss in {"mae", "hybrid"} else "loss"
     history_path = os.path.join(args.out_dir, "metrics_history.csv")
     with open(history_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -596,10 +616,11 @@ def main():
                 f"{train_sec:.2f}",
             ])
 
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
+        current_score = float(val_metrics[best_metric_name])
+        if current_score < best_val_score:
+            best_val_score = current_score
             torch.save(model.state_dict(), best_path)
-            logger.info("New best checkpoint saved: %s", best_path)
+            logger.info("New best checkpoint saved by val_%s: %s", best_metric_name, best_path)
 
     model.load_state_dict(torch.load(best_path, map_location=device))
     test_metrics = evaluate(model, test_loader, criterion, device, use_amp, y_mean, y_std)
