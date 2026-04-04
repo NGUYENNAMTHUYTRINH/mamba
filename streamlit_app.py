@@ -8,7 +8,6 @@ import streamlit as st
 import torch
 import torch.nn as nn
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 
 from mamba_ssm import Mamba
@@ -185,14 +184,8 @@ def split_standardize(
     }
 
 
-def make_split_indices(df_valid: pd.DataFrame, seed: int, split_mode: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def make_split_indices(df_valid: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n = len(df_valid)
-    indices = np.arange(n)
-
-    if split_mode == "random":
-        train_idx, temp_idx = train_test_split(indices, test_size=0.30, random_state=seed, shuffle=True)
-        val_idx, test_idx = train_test_split(temp_idx, test_size=(2.0 / 3.0), random_state=seed, shuffle=True)
-        return train_idx, val_idx, test_idx
 
     if "ts_utc" not in df_valid.columns:
         raise ValueError("Split theo thời gian cần cột 'ts_utc'.")
@@ -347,10 +340,8 @@ def train_pipeline(
     log_interval: int,
     grad_accum_steps: int,
     max_grad_norm: float,
-    split_mode: str,
     run_dir: str | None = None,
     forecast_file_name: str = "future_24h_predictions.csv",
-    export_per_location_files: bool = False,
 ):
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -380,7 +371,7 @@ def train_pipeline(
     loc_to_id = {loc: i for i, loc in enumerate(locations_sorted)}
     loc_ids_all = df_valid["location_key"].astype(str).map(loc_to_id).to_numpy(dtype=np.int64)
 
-    train_idx, val_idx, test_idx = make_split_indices(df_valid, seed=seed, split_mode=split_mode)
+    train_idx, val_idx, test_idx = make_split_indices(df_valid)
 
     split = split_standardize(x_all, y_all, train_idx=train_idx, val_idx=val_idx, test_idx=test_idx)
 
@@ -727,26 +718,10 @@ def main():
     with run3:
         use_gpu = st.checkbox("Dùng GPU (nếu có)", value=True)
 
-    split_mode = st.selectbox(
-        "Kiểu chia dữ liệu",
-        options=["time", "random"],
-        index=0,
-        help="time: chia theo thời gian (khuyến nghị khi muốn dự báo tương lai 24h).",
+    st.info(
+        "Tỉ lệ split cố định theo thời gian: Train 70% | Val 10% | Test 20%. "
+        "Không dùng file test.csv riêng; test là các mốc thời gian gần nhất trong dataset tổng."
     )
-
-    forecast_test_path = st.text_input(
-        "Test CSV để làm mốc forecast +24h",
-        value="dataset/test.csv",
-        help="Ví dụ test là ngày 20 thì model sẽ dự báo ngày 21 theo từng location.",
-    )
-
-    export_per_location_files = st.checkbox(
-        "Xuất thêm file riêng từng location",
-        value=False,
-        help="Mặc định chỉ xuất 1 file tổng future_24h_predictions.csv có cột location_key.",
-    )
-
-    st.info("Tỉ lệ split cố định: Train 70% | Val 10% | Test 20%")
 
     if st.button("Train & Test", type="primary"):
         if len(feature_cols) == 0:
@@ -758,26 +733,12 @@ def main():
 
         with st.spinner("Đang train và evaluate..."):
             try:
-                forecast_base_df_all = None
-                if forecast_test_path.strip():
-                    if not os.path.exists(forecast_test_path):
-                        st.error(f"Không tìm thấy file test: {forecast_test_path}")
-                        return
-                    forecast_base_df_all = pd.read_csv(forecast_test_path)
-
                 run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
                 run_dir = os.path.join("outputs", "streamlit_runs", run_id)
                 os.makedirs(run_dir, exist_ok=True)
 
-                if forecast_base_df_all is not None and "location_key" not in forecast_base_df_all.columns:
-                    st.error("Test CSV cần có cột location_key để lọc theo địa điểm.")
-                    return
-
-                forecast_base_df = forecast_base_df_all
-                if forecast_base_df is not None:
-                    forecast_base_df = forecast_base_df.loc[
-                        forecast_base_df["location_key"].astype(str).isin([str(x) for x in selected_locations])
-                    ].copy()
+                # Use internal 20% latest-time split as test base (no external test.csv).
+                forecast_base_df = None
 
                 summary, hist_df, future_df = train_pipeline(
                     df=df,
@@ -798,9 +759,7 @@ def main():
                     log_interval=50,
                     grad_accum_steps=int(grad_accum_steps),
                     max_grad_norm=float(max_grad_norm),
-                    split_mode=split_mode,
                     run_dir=run_dir,
-                    export_per_location_files=bool(export_per_location_files),
                 )
 
                 summary_df = pd.DataFrame([summary])
@@ -812,12 +771,12 @@ def main():
                     .rename_axis("location_key")
                     .reset_index(name="train_source_rows")
                 )
-                if forecast_base_df is not None and not forecast_base_df.empty:
-                    test_counts = (
-                        forecast_base_df["location_key"].astype(str).value_counts().rename_axis("location_key").reset_index(name="test_source_rows")
-                    )
-                else:
-                    test_counts = pd.DataFrame({"location_key": selected_locations, "test_source_rows": [0] * len(selected_locations)})
+                test_counts = pd.DataFrame(
+                    {
+                        "location_key": selected_locations,
+                        "test_source_rows": [int(summary["split_test"])],
+                    }
+                )
 
                 used_counts = (
                     future_df["location_key"].astype(str).value_counts().rename_axis("location_key").reset_index(name="future_rows")
@@ -877,10 +836,7 @@ def main():
             mime="text/csv",
         )
 
-        if export_per_location_files:
-            st.info("Đã xuất thêm file riêng cho từng location trong thư mục run, ví dụ: future_24h_predictions_hcm.csv")
-        else:
-            st.info("Đang dùng chế độ file tổng: future_24h_predictions.csv (có cột location_key).")
+        st.info("Đã xuất file riêng cho location đã chọn trong thư mục run, ví dụ: future_24h_predictions_hcm.csv")
         if summary.get("per_location_files"):
             st.write("### Các file đã xuất")
             st.dataframe(pd.DataFrame({"file": summary["per_location_files"]}), use_container_width=True)
