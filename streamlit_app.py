@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 from datetime import datetime
 
@@ -8,11 +9,23 @@ import streamlit as st
 import torch
 import torch.nn as nn
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
-from mamba_ssm import Mamba
 import importlib.util
 from pathlib import Path
+
+
+def _load_tft_class():
+    """Load TFT class from Transformer/models/temporal_fusion_t."""
+    try:
+        transformer_root = Path(__file__).parent / "Transformer"
+        if str(transformer_root) not in sys.path:
+            sys.path.insert(0, str(transformer_root))
+        from models.temporal_fusion_t.tft_model import TFT  # type: ignore
+
+        return TFT
+    except Exception:
+        return None
 
 
 def _load_train_module():
@@ -29,66 +42,6 @@ def _load_train_module():
         return None
 
 
-class TabularDataset(Dataset):
-    def __init__(self, x: np.ndarray, loc_ids: np.ndarray, y: np.ndarray):
-        self.x = torch.from_numpy(x).float()
-        self.loc_ids = torch.from_numpy(loc_ids).long()
-        self.y = torch.from_numpy(y).float()
-
-    def __len__(self):
-        return self.y.shape[0]
-
-    def __getitem__(self, idx):
-        return self.x[idx], self.loc_ids[idx], self.y[idx]
-
-
-class TabularMambaRegressor(nn.Module):
-    def __init__(self, num_features: int, num_locations: int, d_model: int = 64, n_layers: int = 2):
-        super().__init__()
-        self.scalar_proj = nn.Linear(1, d_model)
-        self.location_emb = nn.Embedding(num_locations, d_model)
-        self.layers = nn.ModuleList(
-            [
-                Mamba(
-                    d_model=d_model,
-                    d_state=16,
-                    d_conv=4,
-                    expand=2,
-                    use_fast_path=False,
-                )
-                for _ in range(n_layers)
-            ]
-        )
-        self.norm = nn.LayerNorm(d_model)
-        self.head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, 1),
-        )
-        self.num_features = num_features
-
-    def forward(self, x_num: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
-        # x_num: (B, F)
-        x = self.scalar_proj(x_num.unsqueeze(-1))  # (B, F, d_model)
-        loc_token = self.location_emb(loc_ids).unsqueeze(1)  # (B, 1, d_model)
-        x = torch.cat([loc_token, x], dim=1)  # (B, F+1, d_model)
-        for layer in self.layers:
-            x = layer(x)
-        x = self.norm(x)
-        pooled = x.mean(dim=1)
-        return self.head(pooled).squeeze(-1)
-
-
-def unique_keep_order(items: list[str]) -> list[str]:
-    seen = set()
-    out = []
-    for item in items:
-        if item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
-
-
 def sanitize_filename(text: str) -> str:
     safe = []
     for ch in str(text).strip().lower():
@@ -100,142 +53,63 @@ def sanitize_filename(text: str) -> str:
     return name or "unknown_location"
 
 
-def encode_selected_features(df: pd.DataFrame, feature_cols: list[str]) -> tuple[np.ndarray, list[str]]:
-    encoded_parts = []
-    encoded_names = []
+def _predict_future_from_rows(
+    model,
+    combined_df: pd.DataFrame,
+    future_df: pd.DataFrame,
+    numeric_cols: list[str],
+    window_size: int,
+    horizon: int,
+    device,
+    y_mean: float,
+    y_std: float,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+):
+    combined_work = combined_df.copy()
+    for col in numeric_cols:
+        if col not in combined_work.columns:
+            combined_work[col] = 0.0
+        med = pd.to_numeric(combined_work[col], errors="coerce").median()
+        if pd.isna(med):
+            med = 0.0
+        combined_work[col] = pd.to_numeric(combined_work[col], errors="coerce").fillna(float(med))
 
-    for col in feature_cols:
-        s = df[col]
+    preds = []
+    combined_work = combined_work.reset_index(drop=True)
+    future_ts = pd.to_datetime(future_df["ts_utc"], utc=True, errors="coerce")
+    combined_ts = pd.to_datetime(combined_work["ts_utc"], utc=True, errors="coerce")
 
-        if pd.api.types.is_numeric_dtype(s):
-            arr = pd.to_numeric(s, errors="coerce").astype("float32")
-            fill_val = float(arr.median()) if not np.isnan(arr.median()) else 0.0
-            arr = arr.fillna(fill_val).to_numpy().reshape(-1, 1)
-            encoded_parts.append(arr)
-            encoded_names.append(col)
+    # Use integer nanosecond timestamps for robust matching between timezone-aware values.
+    future_ns = future_ts.astype("int64").to_numpy()
+    combined_ns = combined_ts.astype("int64").to_numpy()
+
+    for ts_ns in future_ns:
+        idx_arr = np.where(combined_ns == ts_ns)[0]
+        if len(idx_arr) == 0:
+            preds.append(np.nan)
             continue
 
-        dt = pd.to_datetime(s, errors="coerce", utc=True)
-        if dt.notna().mean() >= 0.6:
-            hour = dt.dt.hour.fillna(0).astype("float32").to_numpy().reshape(-1, 1)
-            dow = dt.dt.dayofweek.fillna(0).astype("float32").to_numpy().reshape(-1, 1)
-            month = dt.dt.month.fillna(1).astype("float32").to_numpy().reshape(-1, 1)
-            doy = dt.dt.dayofyear.fillna(1).astype("float32").to_numpy().reshape(-1, 1)
-            encoded_parts.extend([hour, dow, month, doy])
-            encoded_names.extend([f"{col}_hour", f"{col}_dayofweek", f"{col}_month", f"{col}_dayofyear"])
-        else:
-            cat = s.astype("category").cat.codes.replace(-1, 0).astype("float32").to_numpy().reshape(-1, 1)
-            encoded_parts.append(cat)
-            encoded_names.append(f"{col}_cat")
+        target_idx = int(idx_arr[0])
+        win_end = target_idx - horizon
+        win_start = win_end - window_size + 1
+        if win_start < 0 or win_end < 0:
+            preds.append(np.nan)
+            continue
 
-    if not encoded_parts:
-        raise ValueError("Không có cột đầu vào hợp lệ sau khi encode.")
+        x_window = combined_work.loc[win_start:win_end, numeric_cols].to_numpy(dtype=np.float32)
+        if x_window.shape[0] != window_size:
+            preds.append(np.nan)
+            continue
 
-    x = np.concatenate(encoded_parts, axis=1).astype(np.float32)
-    return x, encoded_names
+        x_window = (x_window - x_mean[0, 0, :]) / x_std[0, 0, :]
+        x_tensor = torch.from_numpy(x_window[None, :, :]).float().to(device)
+        loc_tensor = torch.zeros((1,), dtype=torch.long, device=device)
+        with torch.no_grad():
+            pred = model(x_tensor, loc_tensor).detach().cpu().numpy()[0]
+        preds.append(float(pred * y_std + y_mean))
 
-
-def split_standardize(
-    x: np.ndarray,
-    y: np.ndarray,
-    train_idx: np.ndarray,
-    val_idx: np.ndarray,
-    test_idx: np.ndarray,
-) -> dict:
-    x_train = x[train_idx]
-    x_val = x[val_idx]
-    x_test = x[test_idx]
-
-    y_train = y[train_idx]
-    y_val = y[val_idx]
-    y_test = y[test_idx]
-
-    x_mean = x_train.mean(axis=0, keepdims=True)
-    x_std = x_train.std(axis=0, keepdims=True)
-    x_std = np.where(x_std < 1e-6, 1.0, x_std)
-
-    y_mean = float(y_train.mean())
-    y_std = float(y_train.std())
-    if y_std < 1e-6:
-        y_std = 1.0
-
-    x_train = (x_train - x_mean) / x_std
-    x_val = (x_val - x_mean) / x_std
-    x_test = (x_test - x_mean) / x_std
-
-    y_train = (y_train - y_mean) / y_std
-    y_val = (y_val - y_mean) / y_std
-    y_test = (y_test - y_mean) / y_std
-
-    return {
-        "train_idx": train_idx,
-        "val_idx": val_idx,
-        "test_idx": test_idx,
-        "x_mean": x_mean.astype(np.float32),
-        "x_std": x_std.astype(np.float32),
-        "x_train": x_train.astype(np.float32),
-        "x_val": x_val.astype(np.float32),
-        "x_test": x_test.astype(np.float32),
-        "y_train": y_train.astype(np.float32),
-        "y_val": y_val.astype(np.float32),
-        "y_test": y_test.astype(np.float32),
-        "y_mean": y_mean,
-        "y_std": y_std,
-    }
-
-
-def make_split_indices(df_valid: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    n = len(df_valid)
-
-    if "ts_utc" not in df_valid.columns:
-        raise ValueError("Split theo thời gian cần cột 'ts_utc'.")
-
-    ts = pd.to_datetime(df_valid["ts_utc"], utc=True, errors="coerce")
-    if ts.isna().all():
-        raise ValueError("Cột 'ts_utc' không parse được datetime.")
-
-    if "location_key" in df_valid.columns:
-        train_parts = []
-        val_parts = []
-        test_parts = []
-        work = df_valid.copy()
-        work["_ts"] = ts
-
-        for _, group in work.sort_values("_ts").groupby("location_key", sort=False):
-            g_idx = group.index.to_numpy()
-            m = len(g_idx)
-            if m < 5:
-                # fallback cho nhóm quá nhỏ
-                n_train = max(1, int(m * 0.7))
-                n_val = max(1, int(m * 0.1))
-                if n_train + n_val >= m:
-                    n_val = 1
-                    n_train = max(1, m - 2)
-                n_test = m - n_train - n_val
-                if n_test <= 0:
-                    n_test = 1
-                    n_train = max(1, n_train - 1)
-            else:
-                n_train = int(m * 0.7)
-                n_val = int(m * 0.1)
-                n_test = m - n_train - n_val
-
-            train_parts.append(g_idx[:n_train])
-            val_parts.append(g_idx[n_train:n_train + n_val])
-            test_parts.append(g_idx[n_train + n_val:n_train + n_val + n_test])
-
-        train_idx = np.concatenate(train_parts)
-        val_idx = np.concatenate(val_parts)
-        test_idx = np.concatenate(test_parts)
-        return train_idx, val_idx, test_idx
-
-    sorted_idx = np.argsort(ts.to_numpy())
-    n_train = int(n * 0.7)
-    n_val = int(n * 0.1)
-    train_idx = sorted_idx[:n_train]
-    val_idx = sorted_idx[n_train:n_train + n_val]
-    test_idx = sorted_idx[n_train + n_val:]
-    return train_idx, val_idx, test_idx
+    return np.asarray(preds, dtype=np.float32)
 
 
 def build_future_24h_frame(df_valid: pd.DataFrame, feature_cols: list[str], target_col: str) -> pd.DataFrame:
@@ -321,12 +195,128 @@ def evaluate(model, loader, criterion, device, y_mean, y_std):
     }
 
 
+@torch.no_grad()
+def evaluate_tft(model, loader, criterion, device, y_mean, y_std):
+    model.eval()
+    total_loss = 0.0
+    preds = []
+    targets = []
+
+    for xb, _, yb in loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+
+        future_row = xb[:, -1:, :].clone()
+        x_in = torch.cat([xb, future_row], dim=1)
+
+        out, _, _ = model(x_in)
+        # out: (B, horizon, output_size * num_quantiles), use first output for regression
+        pred = out[:, -1, 0]
+        loss = criterion(pred, yb)
+
+        total_loss += loss.item() * yb.size(0)
+        preds.append(pred.detach().cpu().numpy())
+        targets.append(yb.detach().cpu().numpy())
+
+    preds = np.concatenate(preds, axis=0)
+    targets = np.concatenate(targets, axis=0)
+
+    preds = preds * y_std + y_mean
+    targets = targets * y_std + y_mean
+
+    mse = mean_squared_error(targets, preds)
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(targets, preds))
+    r2 = float(r2_score(targets, preds))
+
+    return {
+        "loss": total_loss / len(loader.dataset),
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2,
+        "preds": preds,
+        "targets": targets,
+    }
+
+
+def _safe_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=np.float32)
+    y_pred = np.asarray(y_pred, dtype=np.float32)
+    denom = np.where(np.abs(y_true) < 1e-6, np.nan, np.abs(y_true))
+    mape = np.nanmean(np.abs((y_true - y_pred) / denom)) * 100.0
+    if np.isnan(mape):
+        return float("nan")
+    return float(mape)
+
+
+def _predict_future_from_rows_tft(
+    model,
+    combined_df: pd.DataFrame,
+    future_df: pd.DataFrame,
+    numeric_cols: list[str],
+    window_size: int,
+    horizon: int,
+    device,
+    y_mean: float,
+    y_std: float,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+):
+    combined_work = combined_df.copy()
+    for col in numeric_cols:
+        if col not in combined_work.columns:
+            combined_work[col] = 0.0
+        med = pd.to_numeric(combined_work[col], errors="coerce").median()
+        if pd.isna(med):
+            med = 0.0
+        combined_work[col] = pd.to_numeric(combined_work[col], errors="coerce").fillna(float(med))
+
+    preds = []
+    combined_work = combined_work.reset_index(drop=True)
+    future_ts = pd.to_datetime(future_df["ts_utc"], utc=True, errors="coerce")
+    combined_ts = pd.to_datetime(combined_work["ts_utc"], utc=True, errors="coerce")
+    future_ns = future_ts.astype("int64").to_numpy()
+    combined_ns = combined_ts.astype("int64").to_numpy()
+
+    for ts_ns in future_ns:
+        idx_arr = np.where(combined_ns == ts_ns)[0]
+        if len(idx_arr) == 0:
+            preds.append(np.nan)
+            continue
+
+        target_idx = int(idx_arr[0])
+        win_end = target_idx - horizon
+        win_start = win_end - window_size + 1
+        if win_start < 0 or win_end < 0:
+            preds.append(np.nan)
+            continue
+
+        x_window = combined_work.loc[win_start:win_end, numeric_cols].to_numpy(dtype=np.float32)
+        if x_window.shape[0] != window_size:
+            preds.append(np.nan)
+            continue
+
+        x_window = (x_window - x_mean[0, 0, :]) / x_std[0, 0, :]
+        future_row = combined_work.loc[target_idx, numeric_cols].to_numpy(dtype=np.float32)
+        future_row = (future_row - x_mean[0, 0, :]) / x_std[0, 0, :]
+        model_input = np.concatenate([x_window, future_row[None, :]], axis=0)
+
+        x_tensor = torch.from_numpy(model_input[None, :, :]).float().to(device)
+        with torch.no_grad():
+            out, _, _ = model(x_tensor)
+            pred = out[:, -1, 0].detach().cpu().numpy()[0]
+        preds.append(float(pred * y_std + y_mean))
+
+    return np.asarray(preds, dtype=np.float32)
+
+
 def train_pipeline(
     df: pd.DataFrame,
     forecast_base_df: pd.DataFrame | None,
     selected_locations: list[str],
     target_col: str,
-    feature_cols: list[str],
+    window_size: int,
+    horizon: int,
     epochs: int,
     batch_size: int,
     lr: float,
@@ -340,16 +330,27 @@ def train_pipeline(
     log_interval: int,
     grad_accum_steps: int,
     max_grad_norm: float,
+    input_feature_cols: list[str] | None = None,
+    include_target_history: bool = True,
     run_dir: str | None = None,
     forecast_file_name: str = "future_24h_predictions.csv",
 ):
+    mod = _load_train_module()
+    if mod is None:
+        raise RuntimeError("Không thể load scripts/train_mamba_aqi.py")
+    required = [
+        "build_time_series_samples",
+        "split_data_by_timeline",
+        "standardize",
+        "AQIDataset",
+        "TimeSeriesMambaRegressorNoLoc",
+    ]
+    for name in required:
+        if not hasattr(mod, name):
+            raise RuntimeError(f"Thiếu helper '{name}' trong scripts/train_mamba_aqi.py")
+
     np.random.seed(seed)
     torch.manual_seed(seed)
-
-    # Defensive sanitize to avoid duplicated labels downstream (e.g. location_key in multiple places).
-    feature_cols = unique_keep_order([c for c in feature_cols if c in df.columns and c != target_col])
-    if not feature_cols:
-        raise ValueError("Không có feature hợp lệ sau khi loại target/column không tồn tại.")
 
     work_df = df.copy()
     if "location_key" not in work_df.columns:
@@ -359,41 +360,54 @@ def train_pipeline(
     if work_df.empty:
         raise ValueError("Không có dữ liệu train cho các location đã chọn.")
 
-    x_all, encoded_feature_names = encode_selected_features(work_df, feature_cols)
-    y_all = pd.to_numeric(work_df[target_col], errors="coerce")
+    x_seq, loc_ids, y, y_ts, num_locations, numeric_cols = mod.build_time_series_samples(
+        df=work_df,
+        target_col=target_col,
+        window_size=window_size,
+        horizon=horizon,
+        input_feature_cols=input_feature_cols,
+        include_target_history=include_target_history,
+    )
+    target_feature_idx = numeric_cols.index(target_col) if target_col in numeric_cols else None
+    train, val, test = mod.split_data_by_timeline(x_seq, loc_ids, y, y_ts)
 
-    valid_mask = ~y_all.isna()
-    x_all = x_all[valid_mask.to_numpy()]
-    y_all = y_all[valid_mask].to_numpy(dtype=np.float32)
-    df_valid = work_df.loc[valid_mask].copy().reset_index(drop=True)
+    # Capture feature normalization stats BEFORE standardization for future-window inference.
+    mean = train.x_seq.mean(axis=(0, 1), keepdims=True)
+    std = train.x_seq.std(axis=(0, 1), keepdims=True)
+    std = np.where(std < 1e-6, 1.0, std)
 
-    locations_sorted = sorted(df_valid["location_key"].astype(str).unique().tolist())
-    loc_to_id = {loc: i for i, loc in enumerate(locations_sorted)}
-    loc_ids_all = df_valid["location_key"].astype(str).map(loc_to_id).to_numpy(dtype=np.int64)
+    train, val, test, y_mean, y_std = mod.standardize(train, val, test)
 
-    train_idx, val_idx, test_idx = make_split_indices(df_valid)
-
-    split = split_standardize(x_all, y_all, train_idx=train_idx, val_idx=val_idx, test_idx=test_idx)
-
-    loc_train = loc_ids_all[train_idx]
-    loc_val = loc_ids_all[val_idx]
-
-    train_ds = TabularDataset(split["x_train"], loc_train, split["y_train"])
-    val_ds = TabularDataset(split["x_val"], loc_val, split["y_val"])
+    train_ds = mod.AQIDataset(train)
+    val_ds = mod.AQIDataset(val)
+    test_ds = mod.AQIDataset(test)
     pin_memory = use_gpu and torch.cuda.is_available()
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
     device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
-    model = TabularMambaRegressor(
-        num_features=split["x_train"].shape[1],
-        num_locations=len(loc_to_id),
+    model = mod.TimeSeriesMambaRegressorNoLoc(
+        num_features=train.x_seq.shape[-1],
         d_model=d_model,
         n_layers=n_layers,
+        target_feature_idx=target_feature_idx,
     ).to(device)
 
     criterion = nn.HuberLoss(delta=1.0) if loss_name == "huber" else nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    total_steps = max(1, epochs * max(1, len(train_loader)))
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        total_steps=total_steps,
+        pct_start=0.1,
+        anneal_strategy="cos",
+        div_factor=10.0,
+        final_div_factor=100.0,
+    )
+    amp_enabled = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     best_val_loss = float("inf")
     best_state = None
@@ -406,6 +420,7 @@ def train_pipeline(
     log_lines = []
 
     start_all = time.time()
+    progress_update_interval = 20
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
@@ -417,25 +432,36 @@ def train_pipeline(
             loc_ids = loc_ids.to(device)
             yb = yb.to(device)
 
-            out = model(xb, loc_ids)
-            loss = criterion(out, yb)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+                out = model(xb, loc_ids)
+                loss = criterion(out, yb)
 
             if not torch.isfinite(loss):
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
-            (loss / grad_accum_steps).backward()
+            if amp_enabled:
+                scaler.scale(loss / grad_accum_steps).backward()
+            else:
+                (loss / grad_accum_steps).backward()
 
             if step % grad_accum_steps == 0 or step == len(train_loader):
                 if max_grad_norm > 0:
+                    if amp_enabled:
+                        scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                optimizer.step()
+                if amp_enabled:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
             running_loss += loss.item() * yb.size(0)
 
             global_step += 1
-            if total_steps > 0:
+            if total_steps > 0 and (step % progress_update_interval == 0 or step == len(train_loader)):
                 prog.progress(min(global_step / total_steps, 1.0))
 
             if log_interval > 0 and (step % log_interval == 0 or step == len(train_loader)):
@@ -445,10 +471,11 @@ def train_pipeline(
                     f"batch_loss={loss.item():.6f} | running_avg={avg_loss:.6f}"
                 )
                 log_lines.append(line)
-                log_box.code("\n".join(log_lines[-20:]))
+                if log_interval > 0:
+                    log_box.code("\n".join(log_lines[-20:]))
 
         train_loss = running_loss / len(train_loader.dataset)
-        val_metrics = evaluate(model, val_loader, criterion, device, split["y_mean"], split["y_std"])
+        val_metrics = evaluate(model, val_loader, criterion, device, y_mean, y_std)
 
         epoch_line = (
             f"Epoch {epoch}/{epochs} done | train_loss={train_loss:.6f} | val_loss={val_metrics['loss']:.6f} | "
@@ -479,45 +506,34 @@ def train_pipeline(
 
     model.load_state_dict(best_state)
     model.to(device)
-    val_metrics = evaluate(model, val_loader, criterion, device, split["y_mean"], split["y_std"])
+    val_metrics = evaluate(model, val_loader, criterion, device, y_mean, y_std)
+    test_metrics = evaluate(model, test_loader, criterion, device, y_mean, y_std)
 
     # Forecast base: user-provided test.csv preferred; fallback to internal split test.
-    base_df = forecast_base_df if forecast_base_df is not None else df_valid.iloc[split["test_idx"]].copy()
+    # Base for forecast is the latest timeline segment in filtered data.
+    base_df = forecast_base_df if forecast_base_df is not None else work_df.copy()
     if not isinstance(base_df, pd.DataFrame) or base_df.empty:
         raise ValueError("Không có dữ liệu test làm mốc để dự báo 24h tiếp theo.")
 
-    base_df = base_df.loc[base_df["location_key"].astype(str).isin(locations_sorted)].copy()
-    if base_df.empty:
-        raise ValueError("Test CSV không có location trùng với dữ liệu train đã chọn.")
-
     # 24h forecast after the last timestamp of each location in test base.
-    future_df = build_future_24h_frame(base_df, feature_cols=feature_cols, target_col=target_col)
-    x_future, _ = encode_selected_features(future_df, feature_cols)
-    x_future = ((x_future - split["x_mean"]) / split["x_std"]).astype(np.float32)
+    future_df = build_future_24h_frame(base_df, feature_cols=numeric_cols, target_col=target_col)
+    combined_df = pd.concat([base_df, future_df], ignore_index=True)
+    combined_df["ts_utc"] = pd.to_datetime(combined_df["ts_utc"], utc=True, errors="coerce")
+    combined_df = combined_df.sort_values("ts_utc").reset_index(drop=True)
 
-    loc_future = future_df["location_key"].astype(str).map(loc_to_id)
-    if loc_future.isna().any():
-        missing = sorted(future_df.loc[loc_future.isna(), "location_key"].astype(str).unique().tolist())
-        raise ValueError(f"Có location trong test không tồn tại trong train: {missing[:5]}")
-
-    future_ds = TabularDataset(
-        x_future,
-        loc_future.to_numpy(dtype=np.int64),
-        np.zeros(len(x_future), dtype=np.float32),
+    future_preds = _predict_future_from_rows(
+        model=model,
+        combined_df=combined_df,
+        future_df=future_df,
+        numeric_cols=numeric_cols,
+        window_size=window_size,
+        horizon=horizon,
+        device=device,
+        y_mean=y_mean,
+        y_std=y_std,
+        x_mean=mean,
+        x_std=std,
     )
-    future_loader = DataLoader(future_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=pin_memory)
-
-    model.eval()
-    future_preds = []
-    with torch.no_grad():
-        for xb, loc_ids, _ in future_loader:
-            xb = xb.to(device)
-            loc_ids = loc_ids.to(device)
-            out = model(xb, loc_ids)
-            future_preds.append(out.detach().cpu().numpy())
-
-    future_preds = np.concatenate(future_preds, axis=0)
-    future_preds = future_preds * split["y_std"] + split["y_mean"]
 
     # Keep forecast output minimal: generated hourly time + predicted target only.
     future_out = future_df[["ts_utc", "location_key"]].copy()
@@ -549,7 +565,7 @@ def train_pipeline(
     # This produces files like future_24h_predictions_<location>.csv without the `location_key` column.
     per_location_files = []
     if "location_key" in future_out.columns:
-        for loc in locations_sorted:
+        for loc in sorted(future_out["location_key"].astype(str).unique().tolist()):
             loc_df = future_out.loc[future_out["location_key"].astype(str) == loc, ["time", f"{target_col}_pred"]].copy()
             loc_path = os.path.join(out_dir, f"future_24h_predictions_{sanitize_filename(loc)}.csv")
             loc_df.to_csv(loc_path, index=False)
@@ -557,16 +573,24 @@ def train_pipeline(
 
     summary = {
         "device": str(device),
-        "n_rows_used": len(y_all),
-        "split_train": len(split["y_train"]),
-        "split_val": len(split["y_val"]),
-        "split_test": len(split["y_test"]),
-        "feature_count_after_encode": split["x_train"].shape[1],
-        "encoded_features": encoded_feature_names,
+        "n_rows_used": len(y),
+        "split_train": len(train.y),
+        "split_val": len(val.y),
+        "split_test": len(test.y),
+        "feature_count_after_encode": train.x_seq.shape[-1],
+        "encoded_features": numeric_cols,
         "val_loss": val_metrics["loss"],
         "val_mae": val_metrics["mae"],
+        "val_mse": float(val_metrics["rmse"] ** 2),
         "val_rmse": val_metrics["rmse"],
         "val_r2": val_metrics["r2"],
+        "val_mape": _safe_mape(val_metrics["targets"], val_metrics["preds"]),
+        "test_loss": test_metrics["loss"],
+        "test_mae": test_metrics["mae"],
+        "test_mse": float(test_metrics["rmse"] ** 2),
+        "test_rmse": test_metrics["rmse"],
+        "test_r2": test_metrics["r2"],
+        "test_mape": _safe_mape(test_metrics["targets"], test_metrics["preds"]),
         "model_path": model_path,
         "metrics_path": metrics_path,
         "future_pred_path": future_pred_path,
@@ -574,7 +598,218 @@ def train_pipeline(
         "future_locations": int(future_out["location_key"].nunique()),
         "per_location_files": per_location_files,
         "run_sec": time.time() - start_all,
+        "sec_per_epoch": (time.time() - start_all) / max(epochs, 1),
     }
+    return summary, pd.DataFrame(history), future_out
+
+
+def train_transformer_pipeline(
+    df: pd.DataFrame,
+    selected_locations: list[str],
+    target_col: str,
+    window_size: int,
+    horizon: int,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    d_model: int,
+    seed: int,
+    num_workers: int,
+    use_gpu: bool,
+    run_dir: str,
+    input_feature_cols: list[str] | None = None,
+    include_target_history: bool = True,
+):
+    mod = _load_train_module()
+    if mod is None:
+        raise RuntimeError("Không thể load scripts/train_mamba_aqi.py")
+    TFT = _load_tft_class()
+    if TFT is None:
+        raise RuntimeError("Không thể load Transformer/models/temporal_fusion_t/tft_model.py")
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    work_df = df.copy()
+    work_df = work_df.loc[work_df["location_key"].astype(str).isin([str(x) for x in selected_locations])].copy()
+    if work_df.empty:
+        raise ValueError("Không có dữ liệu cho location đã chọn để train Transformer.")
+
+    x_seq, loc_ids, y, y_ts, _, numeric_cols = mod.build_time_series_samples(
+        df=work_df,
+        target_col=target_col,
+        window_size=window_size,
+        horizon=horizon,
+        input_feature_cols=input_feature_cols,
+        include_target_history=include_target_history,
+    )
+    train, val, test = mod.split_data_by_timeline(x_seq, loc_ids, y, y_ts)
+
+    x_mean = train.x_seq.mean(axis=(0, 1), keepdims=True)
+    x_std = train.x_seq.std(axis=(0, 1), keepdims=True)
+    x_std = np.where(x_std < 1e-6, 1.0, x_std)
+
+    train, val, test, y_mean, y_std = mod.standardize(train, val, test)
+
+    train_ds = mod.AQIDataset(train)
+    val_ds = mod.AQIDataset(val)
+    test_ds = mod.AQIDataset(test)
+    pin_memory = use_gpu and torch.cuda.is_available()
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+
+    device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
+    tft_params = {
+        "total_time_steps": int(window_size + horizon),
+        "input_size": int(train.x_seq.shape[-1]),
+        "output_size": 1,
+        "category_counts": "[]",
+        "n_workers": int(num_workers),
+        "input_obs_loc": "[0]",
+        "static_input_loc": "[0]",
+        "known_regular_inputs": str(list(range(1, int(train.x_seq.shape[-1])))).replace("'", "\""),
+        "known_categorical_inputs": "[]",
+        "quantiles": [0.5],
+        "device": str(device),
+        "hidden_layer_size": int(d_model),
+        "dropout_rate": 0.1,
+        "max_gradient_norm": 1.0,
+        "lr": float(lr),
+        "batch_size": int(batch_size),
+        "num_epochs": int(epochs),
+        "early_stopping_patience": 5,
+        "num_encoder_steps": int(window_size),
+        "stack_size": 1,
+        "num_heads": 4,
+    }
+    if train.x_seq.shape[-1] <= 1:
+        raise ValueError("TFT cần ít nhất 2 features số để tách known/observed inputs.")
+
+    model = TFT(tft_params).to(device)
+    criterion = nn.HuberLoss(delta=1.0)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    best_val_loss = float("inf")
+    best_state = None
+    history = []
+    start_all = time.time()
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        running_loss = 0.0
+        epoch_start = time.time()
+
+        for xb, _, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            future_row = xb[:, -1:, :].clone()
+            x_in = torch.cat([xb, future_row], dim=1)
+
+            out, _, _ = model(x_in)
+            pred = out[:, -1, 0]
+            loss = criterion(pred, yb)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            running_loss += loss.item() * yb.size(0)
+
+        train_loss = running_loss / len(train_loader.dataset)
+        val_metrics = evaluate_tft(model, val_loader, criterion, device, y_mean, y_std)
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_metrics["loss"],
+                "val_mae": val_metrics["mae"],
+                "val_rmse": val_metrics["rmse"],
+                "val_r2": val_metrics["r2"],
+                "train_sec": time.time() - epoch_start,
+            }
+        )
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state is None:
+        raise RuntimeError("Không có checkpoint hợp lệ cho Transformer.")
+
+    model.load_state_dict(best_state)
+    model.to(device)
+    val_metrics = evaluate_tft(model, val_loader, criterion, device, y_mean, y_std)
+    test_metrics = evaluate_tft(model, test_loader, criterion, device, y_mean, y_std)
+
+    base_df = work_df.copy()
+    future_df = build_future_24h_frame(base_df, feature_cols=numeric_cols, target_col=target_col)
+    combined_df = pd.concat([base_df, future_df], ignore_index=True)
+    combined_df["ts_utc"] = pd.to_datetime(combined_df["ts_utc"], utc=True, errors="coerce")
+    combined_df = combined_df.sort_values("ts_utc").reset_index(drop=True)
+
+    future_preds = _predict_future_from_rows_tft(
+        model=model,
+        combined_df=combined_df,
+        future_df=future_df,
+        numeric_cols=numeric_cols,
+        window_size=window_size,
+        horizon=horizon,
+        device=device,
+        y_mean=y_mean,
+        y_std=y_std,
+        x_mean=x_mean,
+        x_std=x_std,
+    )
+
+    future_out = future_df[["ts_utc", "location_key"]].copy().rename(columns={"ts_utc": "time"})
+    future_out[f"{target_col}_pred"] = future_preds
+    future_out = future_out.sort_values(["location_key", "time"]).reset_index(drop=True)
+
+    os.makedirs(run_dir, exist_ok=True)
+    model_path = os.path.join(run_dir, "best_transformer_tft.pt")
+    metrics_path = os.path.join(run_dir, "metrics_history_transformer.csv")
+    torch.save(model.state_dict(), model_path)
+    pd.DataFrame(history).to_csv(metrics_path, index=False)
+
+    per_location_files = []
+    for loc in sorted(future_out["location_key"].astype(str).unique().tolist()):
+        loc_df = future_out.loc[future_out["location_key"].astype(str) == loc, ["time", f"{target_col}_pred"]].copy()
+        loc_path = os.path.join(run_dir, f"future_24h_predictions_transformer_{sanitize_filename(loc)}.csv")
+        loc_df.to_csv(loc_path, index=False)
+        per_location_files.append(loc_path)
+
+    summary = {
+        "device": str(device),
+        "n_rows_used": len(y),
+        "split_train": len(train.y),
+        "split_val": len(val.y),
+        "split_test": len(test.y),
+        "feature_count_after_encode": train.x_seq.shape[-1],
+        "encoded_features": numeric_cols,
+        "val_loss": val_metrics["loss"],
+        "val_mae": val_metrics["mae"],
+        "val_mse": float(val_metrics["rmse"] ** 2),
+        "val_rmse": val_metrics["rmse"],
+        "val_r2": val_metrics["r2"],
+        "val_mape": _safe_mape(val_metrics["targets"], val_metrics["preds"]),
+        "test_loss": test_metrics["loss"],
+        "test_mae": test_metrics["mae"],
+        "test_mse": float(test_metrics["rmse"] ** 2),
+        "test_rmse": test_metrics["rmse"],
+        "test_r2": test_metrics["r2"],
+        "test_mape": _safe_mape(test_metrics["targets"], test_metrics["preds"]),
+        "model_path": model_path,
+        "metrics_path": metrics_path,
+        "future_pred_path": os.path.join(run_dir, "future_24h_predictions_transformer.csv"),
+        "future_rows": len(future_out),
+        "future_locations": int(future_out["location_key"].nunique()),
+        "per_location_files": per_location_files,
+        "run_sec": time.time() - start_all,
+        "sec_per_epoch": (time.time() - start_all) / max(epochs, 1),
+    }
+
     return summary, pd.DataFrame(history), future_out
 
 
@@ -631,7 +866,7 @@ def main():
         return
 
     reserved_cols = {"y_true", "y_pred", "abs_error"}
-    feature_options = [
+    target_options = [
         c for c in all_cols
         if c not in reserved_cols
         and c not in ["ts_utc", "location_key"]
@@ -672,13 +907,12 @@ def main():
                     x_seq, loc_ids, y, y_ts, num_locations, feature_cols = mod.build_time_series_samples(
                         df_sel, default_target, int(preview_window), int(preview_horizon)
                     )
-                    # Use split function from loaded module when available
-                    if hasattr(mod, "split_data_by_timeline"):
-                        train, val, test = mod.split_data_by_timeline(x_seq, loc_ids, y, y_ts)
+                    if not hasattr(mod, "split_data_by_timeline"):
+                        st.warning("Không thể load helper 'split_data_by_timeline' để preview samples.")
                     else:
-                        train, val, test = split_data_by_timeline(x_seq, loc_ids, y, y_ts)
-                    st.markdown(f"**Preview (1 location)**: total samples={len(y):,}")
-                    st.write(f"Train: {len(train.y):,}  |  Val: {len(val.y):,}  |  Test: {len(test.y):,}")
+                        train, val, test = mod.split_data_by_timeline(x_seq, loc_ids, y, y_ts)
+                        st.markdown(f"**Preview (1 location)**: total samples={len(y):,}")
+                        st.write(f"Train: {len(train.y):,}  |  Val: {len(val.y):,}  |  Test: {len(test.y):,}")
         except Exception as e:
             st.warning(f"Không thể tính preview samples: {e}")
 
@@ -687,18 +921,33 @@ def main():
     with conf1:
         target_col = st.selectbox(
             "Target column (biến cần dự đoán)",
-            options=feature_options,
-            index=feature_options.index("aqi") if "aqi" in feature_options else 0,
+            options=target_options,
+            index=target_options.index("aqi") if "aqi" in target_options else 0,
         )
-        default_features = [c for c in feature_options if c != target_col]
-        feature_cols = st.multiselect(
-            "Input feature columns",
-            options=[c for c in feature_options if c != target_col],
-            default=default_features,
+        metadata_cols = {"ts_utc", "location_key"}
+        input_feature_options = [
+            c for c in all_cols
+            if c not in reserved_cols
+            and c not in metadata_cols
+            and not c.lower().startswith("unnamed:")
+            and c != target_col
+        ]
+        selected_input_cols = st.multiselect(
+            "Input features",
+            options=input_feature_options,
+            default=input_feature_options,
+            help="Chọn các biến đầu vào (không gồm target).",
+        )
+        include_target_history = st.checkbox(
+            "Dùng lịch sử target làm input lag",
+            value=True,
+            help="Bật để model học phần chênh lệch từ giá trị target gần nhất.",
         )
         loss_name = st.selectbox("Loss", options=["huber", "mse"], index=0)
 
     with conf2:
+        window_size = st.number_input("Window size (T)", min_value=1, max_value=168, value=24, step=1)
+        horizon = st.number_input("Horizon", min_value=1, max_value=168, value=1, step=1)
         epochs = st.number_input("Epochs", min_value=1, max_value=200, value=5, step=1)
         batch_size = st.number_input("Batch size", min_value=8, max_value=8192, value=128, step=8)
         lr = st.number_input("Learning rate", min_value=1e-6, max_value=1e-1, value=3e-4, format="%.6f")
@@ -720,15 +969,16 @@ def main():
 
     st.info(
         "Tỉ lệ split cố định theo thời gian: Train 70% | Val 10% | Test 20%. "
-        "Không dùng file test.csv riêng; test là các mốc thời gian gần nhất trong dataset tổng."
+        "Không dùng file test.csv riêng; test là các mốc thời gian gần nhất trong dataset tổng. "
+        "Model train theo time-series B,T,F (single-location, no-embedding)."
     )
 
     if st.button("Train & Test", type="primary"):
-        if len(feature_cols) == 0:
-            st.error("Bạn cần chọn ít nhất 1 cột input.")
-            return
         if len(selected_locations) == 0:
             st.error("Bạn cần chọn ít nhất 1 location.")
+            return
+        if len(selected_input_cols) == 0 and not include_target_history:
+            st.error("Bạn cần chọn ít nhất 1 input feature hoặc bật target lag.")
             return
 
         with st.spinner("Đang train và evaluate..."):
@@ -736,6 +986,8 @@ def main():
                 run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
                 run_dir = os.path.join("outputs", "streamlit_runs", run_id)
                 os.makedirs(run_dir, exist_ok=True)
+                transformer_run_dir = os.path.join("outputs", "streamlit_runs", "Transformer_ouputs", run_id)
+                os.makedirs(transformer_run_dir, exist_ok=True)
 
                 # Use internal 20% latest-time split as test base (no external test.csv).
                 forecast_base_df = None
@@ -745,7 +997,8 @@ def main():
                     forecast_base_df=forecast_base_df,
                     selected_locations=selected_locations,
                     target_col=target_col,
-                    feature_cols=feature_cols,
+                    window_size=int(window_size),
+                    horizon=int(horizon),
                     epochs=int(epochs),
                     batch_size=int(batch_size),
                     lr=float(lr),
@@ -756,10 +1009,30 @@ def main():
                     seed=int(seed),
                     num_workers=int(num_workers),
                     use_gpu=bool(use_gpu),
-                    log_interval=50,
+                    log_interval=0,
                     grad_accum_steps=int(grad_accum_steps),
                     max_grad_norm=float(max_grad_norm),
+                    input_feature_cols=selected_input_cols,
+                    include_target_history=bool(include_target_history),
                     run_dir=run_dir,
+                )
+
+                t_summary, t_hist_df, t_future_df = train_transformer_pipeline(
+                    df=df,
+                    selected_locations=selected_locations,
+                    target_col=target_col,
+                    window_size=int(window_size),
+                    horizon=int(horizon),
+                    epochs=int(epochs),
+                    batch_size=int(batch_size),
+                    lr=float(lr),
+                    d_model=int(d_model),
+                    seed=int(seed),
+                    num_workers=int(num_workers),
+                    use_gpu=bool(use_gpu),
+                    run_dir=transformer_run_dir,
+                    input_feature_cols=selected_input_cols,
+                    include_target_history=bool(include_target_history),
                 )
 
                 summary_df = pd.DataFrame([summary])
@@ -795,6 +1068,53 @@ def main():
         met3.metric("Val R2", f"{summary['val_r2']:.4f}")
         met4.metric("Locations done", f"{int(summary['future_locations']):,}")
 
+        st.write("### So sánh Mamba vs Transformer (TFT)")
+        compare_df = pd.DataFrame(
+            [
+                {
+                    "model": "Mamba",
+                    "train_total_sec": summary["run_sec"],
+                    "sec_per_epoch": summary["sec_per_epoch"],
+                    "val_mae": summary["val_mae"],
+                    "val_mse": summary["val_mse"],
+                    "val_rmse": summary["val_rmse"],
+                    "val_r2": summary["val_r2"],
+                    "val_mape": summary["val_mape"],
+                    "test_mae": summary["test_mae"],
+                    "test_mse": summary["test_mse"],
+                    "test_rmse": summary["test_rmse"],
+                    "test_r2": summary["test_r2"],
+                    "test_mape": summary["test_mape"],
+                },
+                {
+                    "model": "Transformer_TFT",
+                    "train_total_sec": t_summary["run_sec"],
+                    "sec_per_epoch": t_summary["sec_per_epoch"],
+                    "val_mae": t_summary["val_mae"],
+                    "val_mse": t_summary["val_mse"],
+                    "val_rmse": t_summary["val_rmse"],
+                    "val_r2": t_summary["val_r2"],
+                    "val_mape": t_summary["val_mape"],
+                    "test_mae": t_summary["test_mae"],
+                    "test_mse": t_summary["test_mse"],
+                    "test_rmse": t_summary["test_rmse"],
+                    "test_r2": t_summary["test_r2"],
+                    "test_mape": t_summary["test_mape"],
+                },
+            ]
+        )
+        st.dataframe(compare_df, use_container_width=True)
+
+        # Quick winner cards for speed and accuracy
+        faster_model = "Mamba" if summary["run_sec"] <= t_summary["run_sec"] else "Transformer_TFT"
+        better_mae_model = "Mamba" if summary["test_mae"] <= t_summary["test_mae"] else "Transformer_TFT"
+        better_mse_model = "Mamba" if summary["test_mse"] <= t_summary["test_mse"] else "Transformer_TFT"
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Faster model", faster_model, f"Mamba: {summary['run_sec']:.2f}s | TFT: {t_summary['run_sec']:.2f}s")
+        c2.metric("Best Test MAE", better_mae_model, f"Mamba: {summary['test_mae']:.4f} | TFT: {t_summary['test_mae']:.4f}")
+        c3.metric("Best Test MSE", better_mse_model, f"Mamba: {summary['test_mse']:.4f} | TFT: {t_summary['test_mse']:.4f}")
+
         st.write("### Số dòng sau khi lọc theo địa điểm")
         merged_stats = stats_df.merge(
             pd.DataFrame(
@@ -827,6 +1147,9 @@ def main():
         st.write("### Lịch sử train")
         st.dataframe(hist_df, use_container_width=True)
 
+        st.write("### Lịch sử train - Transformer (TFT)")
+        st.dataframe(t_hist_df, use_container_width=True)
+
         st.write("### Dự báo 24 giờ tiếp theo (từng địa điểm)")
         st.dataframe(future_df.head(300), use_container_width=True)
         st.download_button(
@@ -841,11 +1164,19 @@ def main():
             st.write("### Các file đã xuất")
             st.dataframe(pd.DataFrame({"file": summary["per_location_files"]}), use_container_width=True)
 
+        st.write("### Dự báo 24 giờ tiếp theo - Transformer (TFT)")
+        st.dataframe(t_future_df.head(300), use_container_width=True)
+        if t_summary.get("per_location_files"):
+            st.write("### Các file Transformer đã xuất")
+            st.dataframe(pd.DataFrame({"file": t_summary["per_location_files"]}), use_container_width=True)
+
         st.code(
             "\n".join(
                 [
                     f"run_dir: {os.path.dirname(summary['future_pred_path'])}",
                     "Files: future_24h_predictions_<location>.csv",
+                    f"transformer_run_dir: {transformer_run_dir}",
+                    "Files: future_24h_predictions_transformer_<location>.csv",
                 ]
             )
         )

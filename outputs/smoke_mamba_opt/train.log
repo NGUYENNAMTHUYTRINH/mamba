@@ -1,0 +1,22 @@
+2026-04-04 17:05:45,392 | INFO | Loading dataset from: dataset/2025.csv
+2026-04-04 17:05:46,230 | INFO | Total rows loaded: 663197
+2026-04-04 17:05:49,874 | INFO | Using numeric features (17): ['pm25', 'pm10', 'no2', 'o3', 'so2', 'co', 'aod', 'dust', 'uv_index', 'co2', 'aqi', 'aqi_pm25', 'aqi_pm10', 'aqi_no2', 'aqi_o3', 'aqi_so2', 'aqi_co']
+2026-04-04 17:05:49,876 | INFO | Window size: 24 | Horizon: 1
+2026-04-04 17:05:49,876 | INFO | Total time-series samples: 661301
+2026-04-04 17:05:49,876 | INFO | Number of unique locations: 79
+2026-04-04 17:05:53,248 | INFO | Split sizes:
+2026-04-04 17:05:53,253 | INFO |   train: 462910 (70.00%)
+2026-04-04 17:05:53,253 | INFO |   val  : 66130 (10.00%)
+2026-04-04 17:05:53,253 | INFO |   test : 132261 (20.00%)
+2026-04-04 17:05:53,367 | INFO | Training device: cuda
+2026-04-04 17:05:53,390 | INFO | GPU: NVIDIA GeForce RTX 3050 Laptop GPU
+2026-04-04 17:05:53,390 | INFO | AMP enabled: True
+2026-04-04 17:05:53,391 | INFO | Gradient accumulation steps: 1
+2026-04-04 17:06:14,706 | INFO | Epoch 1/1 | step 50/1809 | batch_loss=0.017235 | running_avg=0.079117
+2026-04-04 17:06:28,137 | INFO | Epoch 1/1 | step 100/1809 | batch_loss=0.007010 | running_avg=0.046382
+2026-04-04 17:06:41,604 | INFO | Epoch 1/1 | step 150/1809 | batch_loss=0.008187 | running_avg=0.035117
+2026-04-04 17:06:55,170 | INFO | Epoch 1/1 | step 200/1809 | batch_loss=0.019492 | running_avg=0.028819
+2026-04-04 17:07:08,610 | INFO | Epoch 1/1 | step 250/1809 | batch_loss=0.008527 | running_avg=0.024589
+2026-04-04 17:07:22,097 | INFO | Epoch 1/1 | step 300/1809 | batch_loss=0.004439 | running_avg=0.021871
+2026-04-04 17:07:35,556 | INFO | Epoch 1/1 | step 350/1809 | batch_loss=0.023141 | running_avg=0.019598
+2026-04-04 17:07:49,032 | INFO | Epoch 1/1 | step 400/1809 | batch_loss=0.005198 | running_avg=0.018008

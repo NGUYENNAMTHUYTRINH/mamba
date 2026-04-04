@@ -37,10 +37,19 @@ class AQIDataset(Dataset):
 
 
 class TimeSeriesMambaRegressor(nn.Module):
-    def __init__(self, num_features: int, num_locations: int, d_model: int = 64, n_layers: int = 2):
+    def __init__(
+        self,
+        num_features: int,
+        num_locations: int,
+        d_model: int = 64,
+        n_layers: int = 2,
+        dropout: float = 0.1,
+        target_feature_idx: int | None = None,
+    ):
         super().__init__()
         self.feature_proj = nn.Linear(num_features, d_model)
         self.location_emb = nn.Embedding(num_locations, d_model)
+        self.layer_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers)])
         self.layers = nn.ModuleList(
             [
                 Mamba(
@@ -48,18 +57,21 @@ class TimeSeriesMambaRegressor(nn.Module):
                     d_state=16,
                     d_conv=4,
                     expand=2,
-                    use_fast_path=False,
+                    use_fast_path=True,
                 )
                 for _ in range(n_layers)
             ]
         )
+        self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(d_model)
         self.head = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model * 2, d_model),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(d_model, 1),
         )
         self.num_features = num_features
+        self.target_feature_idx = target_feature_idx
 
     def forward(self, x_seq: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
         # x_seq: (B, T, F)
@@ -67,12 +79,18 @@ class TimeSeriesMambaRegressor(nn.Module):
         loc_token = self.location_emb(loc_ids).unsqueeze(1)  # (B, 1, d_model)
         x = torch.cat([loc_token, x], dim=1)  # (B, T+1, d_model)
 
-        for layer in self.layers:
-            x = layer(x)
+        for norm, layer in zip(self.layer_norms, self.layers):
+            residual = x
+            x = layer(norm(x))
+            x = residual + self.dropout(x)
 
         x = self.norm(x)
         last_token = x[:, -1, :]
-        return self.head(last_token).squeeze(-1)
+        mean_token = x[:, 1:, :].mean(dim=1)
+        pred = self.head(torch.cat([last_token, mean_token], dim=-1)).squeeze(-1)
+        if self.target_feature_idx is not None:
+            pred = pred + x_seq[:, -1, self.target_feature_idx]
+        return pred
 
 
 def setup_logger(out_dir: str):
@@ -100,7 +118,14 @@ def resolve_device(device_arg: str):
     return torch.device(device_arg)
 
 
-def build_time_series_samples(df: pd.DataFrame, target_col: str, window_size: int, horizon: int):
+def build_time_series_samples(
+    df: pd.DataFrame,
+    target_col: str,
+    window_size: int,
+    horizon: int,
+    input_feature_cols: list[str] | None = None,
+    include_target_history: bool = True,
+):
     if target_col not in df.columns:
         raise ValueError(f"Target column '{target_col}' not found in dataset columns: {df.columns.tolist()}")
     if "ts_utc" not in df.columns:
@@ -121,10 +146,23 @@ def build_time_series_samples(df: pd.DataFrame, target_col: str, window_size: in
     work["_loc_id"] = work["location_key"].astype("category").cat.codes.astype(np.int64)
     num_locations = int(work["_loc_id"].max()) + 1
 
-    # Keep only numeric environmental features in model input (exclude metadata columns).
-    numeric_cols = work.select_dtypes(include=[np.number]).columns.tolist()
-    if target_col in numeric_cols:
+    if input_feature_cols is None:
+        # Keep numeric features and include target history as an input lag signal.
+        numeric_cols = work.select_dtypes(include=[np.number]).columns.tolist()
+    else:
+        numeric_cols = [c for c in input_feature_cols if c in work.columns]
+        if not numeric_cols:
+            raise ValueError("input_feature_cols is empty after filtering existing columns.")
+        non_numeric = [c for c in numeric_cols if not pd.api.types.is_numeric_dtype(work[c])]
+        if non_numeric:
+            raise ValueError(f"All selected input features must be numeric. Non-numeric: {non_numeric}")
+
+    if include_target_history:
+        if target_col not in numeric_cols:
+            numeric_cols.append(target_col)
+    elif target_col in numeric_cols:
         numeric_cols.remove(target_col)
+
     if "_loc_id" in numeric_cols:
         numeric_cols.remove("_loc_id")
 
@@ -181,9 +219,17 @@ class TimeSeriesMambaRegressorNoLoc(nn.Module):
     Use when training on a single location (filtering the dataframe first).
     The forward signature keeps `loc_ids` for compatibility with existing loaders.
     """
-    def __init__(self, num_features: int, d_model: int = 64, n_layers: int = 2):
+    def __init__(
+        self,
+        num_features: int,
+        d_model: int = 64,
+        n_layers: int = 2,
+        dropout: float = 0.1,
+        target_feature_idx: int | None = None,
+    ):
         super().__init__()
         self.feature_proj = nn.Linear(num_features, d_model)
+        self.layer_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers)])
         self.layers = nn.ModuleList(
             [
                 Mamba(
@@ -191,26 +237,35 @@ class TimeSeriesMambaRegressorNoLoc(nn.Module):
                     d_state=16,
                     d_conv=4,
                     expand=2,
-                    use_fast_path=False,
+                    use_fast_path=True,
                 )
                 for _ in range(n_layers)
             ]
         )
+        self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(d_model)
         self.head = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model * 2, d_model),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(d_model, 1),
         )
+        self.target_feature_idx = target_feature_idx
 
     def forward(self, x_seq: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
         # x_seq: (B, T, F)
         x = self.feature_proj(x_seq)  # (B, T, d_model)
-        for layer in self.layers:
-            x = layer(x)
+        for norm, layer in zip(self.layer_norms, self.layers):
+            residual = x
+            x = layer(norm(x))
+            x = residual + self.dropout(x)
         x = self.norm(x)
         last_token = x[:, -1, :]
-        return self.head(last_token).squeeze(-1)
+        mean_token = x.mean(dim=1)
+        pred = self.head(torch.cat([last_token, mean_token], dim=-1)).squeeze(-1)
+        if self.target_feature_idx is not None:
+            pred = pred + x_seq[:, -1, self.target_feature_idx]
+        return pred
 
 
 def split_data_by_timeline(
@@ -425,6 +480,7 @@ def main():
         window_size=args.window_size,
         horizon=args.horizon,
     )
+    target_feature_idx = feature_cols.index(args.target_col) if args.target_col in feature_cols else None
     logger.info("Using numeric features (%d): %s", len(feature_cols), feature_cols)
     logger.info("Window size: %d | Horizon: %d", args.window_size, args.horizon)
     logger.info("Total time-series samples: %d", len(y))
@@ -478,6 +534,7 @@ def main():
             num_features=train.x_seq.shape[-1],
             d_model=args.d_model,
             n_layers=args.n_layers,
+            target_feature_idx=target_feature_idx,
         ).to(device)
     else:
         model = TimeSeriesMambaRegressor(
@@ -485,6 +542,7 @@ def main():
             num_locations=num_locations,
             d_model=args.d_model,
             n_layers=args.n_layers,
+            target_feature_idx=target_feature_idx,
         ).to(device)
 
     criterion = nn.HuberLoss(delta=1.0) if args.loss == "huber" else nn.MSELoss()
