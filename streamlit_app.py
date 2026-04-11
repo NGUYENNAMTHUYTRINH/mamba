@@ -1,5 +1,7 @@
 import os
+import sys
 import time
+import subprocess
 from datetime import datetime
 
 import numpy as np
@@ -8,10 +10,195 @@ import streamlit as st
 import torch
 import torch.nn as nn
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 
 from mamba_ssm import Mamba
+import importlib.util
+from pathlib import Path
+import yaml
+
+
+def _load_train_module():
+    """Dynamically load scripts/train_mamba_aqi.py and return the module.
+    This avoids package import issues when running Streamlit.
+    """
+    try:
+        mod_path = Path(__file__).parent / "scripts" / "train_mamba_aqi.py"
+        spec = importlib.util.spec_from_file_location("train_mamba_aqi_for_streamlit", str(mod_path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def run_tft_pipeline(
+    selected_location: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    weight_decay: float,
+    loss_name: str,
+    seed: int,
+    use_gpu: bool,
+    run_dir: str,
+) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+    """Run Transformer_Timeseries TFT pipeline and return summary/history/predictions.
+
+    Uses subprocess to avoid import path collisions between root repo and Transformer_Timeseries package layout.
+    """
+    repo_root = Path(__file__).parent
+    tft_root = repo_root / "Transformer_Timeseries"
+    base_conf_path = tft_root / "conf" / "air_quality.yaml"
+    if not base_conf_path.exists():
+        raise FileNotFoundError(f"Không tìm thấy config TFT: {base_conf_path}")
+
+    with open(base_conf_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    cfg["model"] = "tf_transformer"
+    cfg["num_epochs"] = int(epochs)
+    cfg["batch_size"] = int(batch_size)
+    cfg["lr"] = float(lr)
+    cfg["weight_decay"] = float(weight_decay)
+    cfg["loss"] = str(loss_name)
+    cfg["device"] = "cuda" if (use_gpu and torch.cuda.is_available()) else "cpu"
+    cfg["seed"] = int(seed)
+    cfg["point_forecast"] = True
+    cfg["use_quantile_loss_for_tft"] = False
+    cfg["quantiles"] = [0.5]
+
+    run_dir_abs = Path(run_dir).resolve()
+    os.makedirs(run_dir_abs, exist_ok=True)
+    runtime_conf_path = (run_dir_abs / "air_quality_tft_runtime.yaml").resolve()
+    with open(runtime_conf_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+
+    exp_name = f"streamlit_tft_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    cmd = [
+        sys.executable,
+        "main.py",
+        "--exp_name",
+        exp_name,
+        "--conf_file_path",
+        str(runtime_conf_path),
+        "--seed",
+        str(int(seed)),
+        "--location",
+        str(selected_location),
+    ]
+
+    started = time.time()
+    proc = subprocess.run(
+        cmd,
+        cwd=str(tft_root),
+        capture_output=True,
+        text=True,
+    )
+    run_sec = time.time() - started
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "TFT chạy lỗi.\n"
+            f"Exit code: {proc.returncode}\n"
+            f"STDOUT:\n{proc.stdout[-4000:]}\n\n"
+            f"STDERR:\n{proc.stderr[-4000:]}"
+        )
+
+    exp_root = tft_root / "log" / cfg["model"] / exp_name
+    if not exp_root.exists():
+        raise FileNotFoundError(f"Không tìm thấy thư mục log TFT: {exp_root}")
+
+    run_dirs = [p for p in exp_root.iterdir() if p.is_dir()]
+    if not run_dirs:
+        raise FileNotFoundError(f"Không có run folder trong: {exp_root}")
+    latest_run_dir = max(run_dirs, key=lambda p: p.stat().st_mtime)
+
+    pred_name = f"transformer_predictions_{selected_location}.csv"
+    pred_path = latest_run_dir / pred_name
+    if not pred_path.exists():
+        candidates = sorted(latest_run_dir.glob("transformer_predictions_*.csv"), key=lambda p: p.stat().st_mtime)
+        if not candidates:
+            raise FileNotFoundError(f"Không tìm thấy file dự đoán TFT trong: {latest_run_dir}")
+        pred_path = candidates[-1]
+
+    pred_df = pd.read_csv(pred_path)
+    if not {"actual_aqi", "predicted_aqi"}.issubset(pred_df.columns):
+        raise ValueError(f"File dự đoán TFT không đúng format: {pred_path}")
+
+    y_true = pd.to_numeric(pred_df["actual_aqi"], errors="coerce").dropna().to_numpy(dtype=np.float32)
+    y_pred = pd.to_numeric(pred_df["predicted_aqi"], errors="coerce").dropna().to_numpy(dtype=np.float32)
+    n = min(len(y_true), len(y_pred))
+    if n == 0:
+        raise ValueError("Không có dữ liệu dự đoán hợp lệ trong file TFT.")
+    y_true = y_true[:n]
+    y_pred = y_pred[:n]
+
+    mse = mean_squared_error(y_true, y_pred)
+    last_mae = float(mean_absolute_error(y_true, y_pred))
+    last_rmse = float(np.sqrt(mse))
+    last_r2 = float(r2_score(y_true, y_pred))
+    summary = {
+        "model": "tft",
+        "device": cfg["device"],
+        "seed": int(seed),
+        "test_mae": last_mae,
+        "test_rmse": last_rmse,
+        "test_r2": last_r2,
+        "run_sec": float(run_sec),
+        "pred_path": str(pred_path),
+        "log_dir": str(latest_run_dir),
+        "stdout_tail": proc.stdout[-2000:],
+        "tft_last_test_mae": last_mae,
+        "tft_last_test_rmse": last_rmse,
+        "tft_last_test_r2": last_r2,
+    }
+
+    metrics_path = latest_run_dir / "metrics_history.csv"
+    if metrics_path.exists():
+        history_df = pd.read_csv(metrics_path)
+        summary["metrics_path"] = str(metrics_path)
+
+        required_cols = {"test_loss", "test_mae", "test_rmse", "test_r2"}
+        if required_cols.issubset(set(history_df.columns)) and not history_df.empty:
+            history_df = history_df.sort_values("epoch").reset_index(drop=True)
+            best_idx = pd.to_numeric(history_df["test_loss"], errors="coerce").idxmin()
+            best_row = history_df.loc[best_idx]
+            last_row = history_df.iloc[-1]
+
+            summary["tft_best_epoch"] = int(best_row.get("epoch", np.nan))
+            summary["tft_best_test_loss"] = float(best_row.get("test_loss", np.nan))
+            summary["tft_best_test_mae"] = float(best_row.get("test_mae", np.nan))
+            summary["tft_best_test_rmse"] = float(best_row.get("test_rmse", np.nan))
+            summary["tft_best_test_r2"] = float(best_row.get("test_r2", np.nan))
+
+            summary["tft_hist_last_epoch"] = int(last_row.get("epoch", np.nan))
+            summary["tft_hist_last_test_loss"] = float(last_row.get("test_loss", np.nan))
+            summary["tft_hist_last_test_mae"] = float(last_row.get("test_mae", np.nan))
+            summary["tft_hist_last_test_rmse"] = float(last_row.get("test_rmse", np.nan))
+            summary["tft_hist_last_test_r2"] = float(last_row.get("test_r2", np.nan))
+
+            # Default compare target for TFT is best-by-test-loss, mirroring checkpoint selection behavior.
+            summary["test_mae"] = summary["tft_best_test_mae"]
+            summary["test_rmse"] = summary["tft_best_test_rmse"]
+            summary["test_r2"] = summary["tft_best_test_r2"]
+            summary["selection"] = "best_test_loss"
+        else:
+            summary["selection"] = "last_prediction_file"
+    else:
+        history_df = pd.DataFrame(
+            [{
+                "epoch": cfg["num_epochs"],
+                "test_mae": summary["test_mae"],
+                "test_rmse": summary["test_rmse"],
+                "test_r2": summary["test_r2"],
+                "run_sec": summary["run_sec"],
+            }]
+        )
+        summary["metrics_path"] = ""
+        summary["selection"] = "last_prediction_file"
+
+    return summary, history_df, pred_df
 
 
 class TabularDataset(Dataset):
@@ -169,14 +356,44 @@ def split_standardize(
     }
 
 
-def make_split_indices(df_valid: pd.DataFrame, seed: int, split_mode: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    n = len(df_valid)
-    indices = np.arange(n)
+def split_data_by_timeline(
+    x_seq: np.ndarray,
+    loc_ids: np.ndarray,
+    y: np.ndarray,
+    y_ts: np.ndarray,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.1,
+):
+    """Fallback helper mirroring scripts/train_mamba_aqi.py split behavior."""
+    if len(y) < 3:
+        raise ValueError("Need at least 3 samples for train/val/test split.")
 
-    if split_mode == "random":
-        train_idx, temp_idx = train_test_split(indices, test_size=0.30, random_state=seed, shuffle=True)
-        val_idx, test_idx = train_test_split(temp_idx, test_size=(2.0 / 3.0), random_state=seed, shuffle=True)
-        return train_idx, val_idx, test_idx
+    order = np.argsort(y_ts)
+    n = len(order)
+    train_end = int(n * train_ratio)
+    val_end = train_end + int(n * val_ratio)
+
+    if train_end <= 0 or val_end <= train_end or val_end >= n:
+        raise ValueError("Invalid timeline split sizes.")
+
+    class _Split:
+        def __init__(self, x, l, yy):
+            self.x_seq = x
+            self.loc_ids = l
+            self.y = yy
+
+    train_idx = order[:train_end]
+    val_idx = order[train_end:val_end]
+    test_idx = order[val_end:]
+    return (
+        _Split(x_seq[train_idx], loc_ids[train_idx], y[train_idx]),
+        _Split(x_seq[val_idx], loc_ids[val_idx], y[val_idx]),
+        _Split(x_seq[test_idx], loc_ids[test_idx], y[test_idx]),
+    )
+
+
+def make_split_indices(df_valid: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = len(df_valid)
 
     if "ts_utc" not in df_valid.columns:
         raise ValueError("Split theo thời gian cần cột 'ts_utc'.")
@@ -331,10 +548,8 @@ def train_pipeline(
     log_interval: int,
     grad_accum_steps: int,
     max_grad_norm: float,
-    split_mode: str,
     run_dir: str | None = None,
     forecast_file_name: str = "future_24h_predictions.csv",
-    export_per_location_files: bool = False,
 ):
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -364,18 +579,21 @@ def train_pipeline(
     loc_to_id = {loc: i for i, loc in enumerate(locations_sorted)}
     loc_ids_all = df_valid["location_key"].astype(str).map(loc_to_id).to_numpy(dtype=np.int64)
 
-    train_idx, val_idx, test_idx = make_split_indices(df_valid, seed=seed, split_mode=split_mode)
+    train_idx, val_idx, test_idx = make_split_indices(df_valid)
 
     split = split_standardize(x_all, y_all, train_idx=train_idx, val_idx=val_idx, test_idx=test_idx)
 
     loc_train = loc_ids_all[train_idx]
     loc_val = loc_ids_all[val_idx]
+    loc_test = loc_ids_all[test_idx]
 
     train_ds = TabularDataset(split["x_train"], loc_train, split["y_train"])
     val_ds = TabularDataset(split["x_val"], loc_val, split["y_val"])
+    test_ds = TabularDataset(split["x_test"], loc_test, split["y_test"])
     pin_memory = use_gpu and torch.cuda.is_available()
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
     device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
     model = TabularMambaRegressor(
@@ -473,6 +691,7 @@ def train_pipeline(
     model.load_state_dict(best_state)
     model.to(device)
     val_metrics = evaluate(model, val_loader, criterion, device, split["y_mean"], split["y_std"])
+    test_metrics = evaluate(model, test_loader, criterion, device, split["y_mean"], split["y_std"])
 
     # Forecast base: user-provided test.csv preferred; fallback to internal split test.
     base_df = forecast_base_df if forecast_base_df is not None else df_valid.iloc[split["test_idx"]].copy()
@@ -530,10 +749,18 @@ def train_pipeline(
 
     torch.save(model.state_dict(), model_path)
     pd.DataFrame(history).to_csv(metrics_path, index=False)
-    future_out.to_csv(future_pred_path, index=False)
+    # Do NOT write the combined `future_24h_predictions.csv` file; produce per-location files only.
+    # If an old combined file exists in the output dir (from previous runs), remove it.
+    if os.path.exists(future_pred_path):
+        try:
+            os.remove(future_pred_path)
+        except Exception:
+            pass
 
+    # Always emit per-location CSVs (time + prediction only) alongside the combined file.
+    # This produces files like future_24h_predictions_<location>.csv without the `location_key` column.
     per_location_files = []
-    if export_per_location_files:
+    if "location_key" in future_out.columns:
         for loc in locations_sorted:
             loc_df = future_out.loc[future_out["location_key"].astype(str) == loc, ["time", f"{target_col}_pred"]].copy()
             loc_path = os.path.join(out_dir, f"future_24h_predictions_{sanitize_filename(loc)}.csv")
@@ -552,6 +779,10 @@ def train_pipeline(
         "val_mae": val_metrics["mae"],
         "val_rmse": val_metrics["rmse"],
         "val_r2": val_metrics["r2"],
+    "test_loss": test_metrics["loss"],
+    "test_mae": test_metrics["mae"],
+    "test_rmse": test_metrics["rmse"],
+    "test_r2": test_metrics["r2"],
         "model_path": model_path,
         "metrics_path": metrics_path,
         "future_pred_path": future_pred_path,
@@ -623,6 +854,50 @@ def main():
         and not c.lower().startswith("unnamed:")
     ]
 
+    # LOCATION selector first: choose locations, preview counts/splits, then show train config
+    st.subheader("Chọn địa điểm để train + forecast riêng (trước khi cấu hình)")
+    # Restrict to single location selection for per-location training
+    selected_location = st.selectbox(
+        "Chọn địa điểm để train + forecast riêng",
+        options=locations,
+        index=0,
+        help="Chọn 1 địa điểm để train và forecast riêng cho tỉnh/thành đó.",
+    )
+    selected_locations = [selected_location]
+
+    # quick window/horizon preview inputs used to estimate sample counts
+    preview_col1, preview_col2 = st.columns([1, 1])
+    with preview_col1:
+        preview_window = st.number_input("Preview window size (timesteps)", min_value=1, max_value=168, value=24, step=1)
+    with preview_col2:
+        preview_horizon = st.number_input("Preview horizon", min_value=1, max_value=168, value=1, step=1)
+
+    # show counts for selected locations using default target 'aqi' if available
+    if selected_locations:
+        try:
+            df_sel = df.loc[df["location_key"].astype(str).isin([str(x) for x in selected_locations])].copy()
+            # choose a reasonable default target for preview
+            default_target = "aqi" if "aqi" in df_sel.columns else next((c for c in df_sel.select_dtypes(include=["number"]).columns if c not in ["_loc_id"]), None)
+            if default_target is None:
+                st.warning("Không tìm thấy cột số nào để preview sample counts. Cấu hình train sẽ yêu cầu chọn target.")
+            else:
+                mod = _load_train_module()
+                if mod is None or not hasattr(mod, "build_time_series_samples"):
+                    st.warning("Không thể load helper 'build_time_series_samples' để preview samples.")
+                else:
+                    x_seq, loc_ids, y, y_ts, num_locations, feature_cols = mod.build_time_series_samples(
+                        df_sel, default_target, int(preview_window), int(preview_horizon)
+                    )
+                    # Use split function from loaded module when available
+                    if hasattr(mod, "split_data_by_timeline"):
+                        train, val, test = mod.split_data_by_timeline(x_seq, loc_ids, y, y_ts)
+                    else:
+                        train, val, test = split_data_by_timeline(x_seq, loc_ids, y, y_ts)
+                    st.markdown(f"**Preview (1 location)**: total samples={len(y):,}")
+                    st.write(f"Train: {len(train.y):,}  |  Val: {len(val.y):,}  |  Test: {len(test.y):,}")
+        except Exception as e:
+            st.warning(f"Không thể tính preview samples: {e}")
+
     st.subheader("Cấu hình train")
     conf1, conf2, conf3 = st.columns(3)
     with conf1:
@@ -659,33 +934,16 @@ def main():
     with run3:
         use_gpu = st.checkbox("Dùng GPU (nếu có)", value=True)
 
-    split_mode = st.selectbox(
-        "Kiểu chia dữ liệu",
-        options=["time", "random"],
-        index=0,
-        help="time: chia theo thời gian (khuyến nghị khi muốn dự báo tương lai 24h).",
+    compare_with_tft = st.checkbox(
+        "Chạy thêm TFT để so sánh",
+        value=True,
+        help="Khi bật, app sẽ train Mamba + TFT và hiển thị bảng compare test metrics trong cùng run.",
     )
 
-    selected_locations = st.multiselect(
-        "Chọn địa điểm để train + forecast riêng",
-        options=locations,
-        default=locations[:1],
-        help="Mặc định chọn 1 địa điểm. Bạn có thể chọn thêm nhiều địa điểm nếu muốn.",
+    st.info(
+        "Tỉ lệ split cố định theo thời gian: Train 70% | Val 10% | Test 20%. "
+        "Không dùng file test.csv riêng; test là các mốc thời gian gần nhất trong dataset tổng."
     )
-
-    forecast_test_path = st.text_input(
-        "Test CSV để làm mốc forecast +24h",
-        value="dataset/test.csv",
-        help="Ví dụ test là ngày 20 thì model sẽ dự báo ngày 21 theo từng location.",
-    )
-
-    export_per_location_files = st.checkbox(
-        "Xuất thêm file riêng từng location",
-        value=False,
-        help="Mặc định chỉ xuất 1 file tổng future_24h_predictions.csv có cột location_key.",
-    )
-
-    st.info("Tỉ lệ split cố định: Train 70% | Val 10% | Test 20%")
 
     if st.button("Train & Test", type="primary"):
         if len(feature_cols) == 0:
@@ -697,26 +955,12 @@ def main():
 
         with st.spinner("Đang train và evaluate..."):
             try:
-                forecast_base_df_all = None
-                if forecast_test_path.strip():
-                    if not os.path.exists(forecast_test_path):
-                        st.error(f"Không tìm thấy file test: {forecast_test_path}")
-                        return
-                    forecast_base_df_all = pd.read_csv(forecast_test_path)
-
                 run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
                 run_dir = os.path.join("outputs", "streamlit_runs", run_id)
                 os.makedirs(run_dir, exist_ok=True)
 
-                if forecast_base_df_all is not None and "location_key" not in forecast_base_df_all.columns:
-                    st.error("Test CSV cần có cột location_key để lọc theo địa điểm.")
-                    return
-
-                forecast_base_df = forecast_base_df_all
-                if forecast_base_df is not None:
-                    forecast_base_df = forecast_base_df.loc[
-                        forecast_base_df["location_key"].astype(str).isin([str(x) for x in selected_locations])
-                    ].copy()
+                # Use internal 20% latest-time split as test base (no external test.csv).
+                forecast_base_df = None
 
                 summary, hist_df, future_df = train_pipeline(
                     df=df,
@@ -737,10 +981,25 @@ def main():
                     log_interval=50,
                     grad_accum_steps=int(grad_accum_steps),
                     max_grad_norm=float(max_grad_norm),
-                    split_mode=split_mode,
                     run_dir=run_dir,
-                    export_per_location_files=bool(export_per_location_files),
                 )
+
+                tft_summary = None
+                tft_hist_df = None
+                tft_pred_df = None
+                if compare_with_tft:
+                    with st.spinner("Đang chạy TFT để so sánh..."):
+                        tft_summary, tft_hist_df, tft_pred_df = run_tft_pipeline(
+                            selected_location=selected_location,
+                            epochs=int(epochs),
+                            batch_size=int(batch_size),
+                            lr=float(lr),
+                            weight_decay=float(weight_decay),
+                            loss_name=loss_name,
+                            seed=int(seed),
+                            use_gpu=bool(use_gpu),
+                            run_dir=run_dir,
+                        )
 
                 summary_df = pd.DataFrame([summary])
 
@@ -751,12 +1010,12 @@ def main():
                     .rename_axis("location_key")
                     .reset_index(name="train_source_rows")
                 )
-                if forecast_base_df is not None and not forecast_base_df.empty:
-                    test_counts = (
-                        forecast_base_df["location_key"].astype(str).value_counts().rename_axis("location_key").reset_index(name="test_source_rows")
-                    )
-                else:
-                    test_counts = pd.DataFrame({"location_key": selected_locations, "test_source_rows": [0] * len(selected_locations)})
+                test_counts = pd.DataFrame(
+                    {
+                        "location_key": selected_locations,
+                        "test_source_rows": [int(summary["split_test"])],
+                    }
+                )
 
                 used_counts = (
                     future_df["location_key"].astype(str).value_counts().rename_axis("location_key").reset_index(name="future_rows")
@@ -807,6 +1066,58 @@ def main():
         st.write("### Lịch sử train")
         st.dataframe(hist_df, use_container_width=True)
 
+        if compare_with_tft and tft_summary is not None:
+            st.write("### So sánh Mamba vs TFT (test metrics)")
+            st.caption("Benchmark chuẩn: cùng loss, cùng seed; Mamba dùng best checkpoint theo val, TFT dùng best epoch theo test_loss (nếu có history).")
+            compare_df = pd.DataFrame(
+                [
+                    {
+                        "model": "mamba_best(val)",
+                        "test_mae": summary.get("test_mae"),
+                        "test_rmse": summary.get("test_rmse"),
+                        "test_r2": summary.get("test_r2"),
+                        "run_sec": summary.get("run_sec"),
+                    },
+                    {
+                        "model": "tft_best(test_loss)",
+                        "test_mae": tft_summary.get("test_mae"),
+                        "test_rmse": tft_summary.get("test_rmse"),
+                        "test_r2": tft_summary.get("test_r2"),
+                        "run_sec": tft_summary.get("run_sec"),
+                    },
+                ]
+            )
+            st.dataframe(compare_df, use_container_width=True)
+
+            tft_modes_df = pd.DataFrame(
+                [
+                    {
+                        "mode": "tft_best(test_loss)",
+                        "epoch": tft_summary.get("tft_best_epoch"),
+                        "test_mae": tft_summary.get("tft_best_test_mae"),
+                        "test_rmse": tft_summary.get("tft_best_test_rmse"),
+                        "test_r2": tft_summary.get("tft_best_test_r2"),
+                    },
+                    {
+                        "mode": "tft_last(history)",
+                        "epoch": tft_summary.get("tft_hist_last_epoch"),
+                        "test_mae": tft_summary.get("tft_hist_last_test_mae", tft_summary.get("tft_last_test_mae")),
+                        "test_rmse": tft_summary.get("tft_hist_last_test_rmse", tft_summary.get("tft_last_test_rmse")),
+                        "test_r2": tft_summary.get("tft_hist_last_test_r2", tft_summary.get("tft_last_test_r2")),
+                    },
+                ]
+            )
+            st.write("### TFT benchmark modes")
+            st.dataframe(tft_modes_df, use_container_width=True)
+
+            if tft_hist_df is not None and not tft_hist_df.empty:
+                st.write("### Lịch sử train TFT")
+                st.dataframe(tft_hist_df, use_container_width=True)
+
+            if tft_pred_df is not None and not tft_pred_df.empty:
+                st.write("### TFT predictions preview")
+                st.dataframe(tft_pred_df.head(100), use_container_width=True)
+
         st.write("### Dự báo 24 giờ tiếp theo (từng địa điểm)")
         st.dataframe(future_df.head(300), use_container_width=True)
         st.download_button(
@@ -816,10 +1127,7 @@ def main():
             mime="text/csv",
         )
 
-        if export_per_location_files:
-            st.info("Đã xuất thêm file riêng cho từng location trong thư mục run, ví dụ: future_24h_predictions_hcm.csv")
-        else:
-            st.info("Đang dùng chế độ file tổng: future_24h_predictions.csv (có cột location_key).")
+        st.info("Đã xuất file riêng cho location đã chọn trong thư mục run, ví dụ: future_24h_predictions_hcm.csv")
         if summary.get("per_location_files"):
             st.write("### Các file đã xuất")
             st.dataframe(pd.DataFrame({"file": summary["per_location_files"]}), use_container_width=True)
