@@ -6,7 +6,7 @@ from abc import abstractmethod
 from typing import Union
 
 import torch
-from path import Path
+from pathlib import Path
 from torch import nn
 
 

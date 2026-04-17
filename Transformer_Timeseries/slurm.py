@@ -4,7 +4,7 @@
 import subprocess
 
 import click
-from path import Path
+from pathlib import Path
 
 
 # -----------------------------

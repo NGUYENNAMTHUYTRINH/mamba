@@ -406,7 +406,7 @@ class Trainer(object):
             if self.best_test_loss is None or test_metrics['test_loss'] < self.best_test_loss:
                 self.best_test_loss = test_metrics['test_loss']
                 self.no_improve_epochs = 0
-                torch.save(self.model.state_dict(), self.log_path / self.cnf.exp_name + '_best.pth')
+                torch.save(self.model.state_dict(), self.log_path / (self.cnf.exp_name + '_best.pth'))
                 if test_metrics.get('all_targets') is not None and test_metrics.get('all_preds') is not None:
                     if len(test_metrics['all_targets']) > 0 and len(test_metrics['all_preds']) > 0:
                         self._save_predictions_csv(test_metrics['all_targets'], test_metrics['all_preds'])

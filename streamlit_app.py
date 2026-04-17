@@ -10,6 +10,7 @@ import streamlit as st
 import torch
 import torch.nn as nn
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 
 from mamba_ssm import Mamba
@@ -201,7 +202,315 @@ def run_tft_pipeline(
     return summary, history_df, pred_df
 
 
+class SequenceDataset(Dataset):
+    """Dataset for LSTM time series forecasting."""
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = torch.from_numpy(X).float()
+        self.y = torch.from_numpy(y).float()
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+class LSTMForecaster(nn.Module):
+    """LSTM model for time series forecasting."""
+    def __init__(self, input_size: int, hidden_size: int = 64, num_layers: int = 2, 
+                 dropout: float = 0.2, horizon: int = 1):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size, 
+            hidden_size, 
+            num_layers=num_layers,
+            batch_first=True, 
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        self.fc = nn.Linear(hidden_size, horizon)
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, T, input_size)
+        output: (B, horizon)
+        """
+        out, _ = self.lstm(x)
+        h_last = out[:, -1, :]  # (B, hidden_size)
+        return self.fc(h_last)
+
+
 class TabularDataset(Dataset):
+    """Dataset for Mamba tabular forecasting."""
+    def __init__(self, x: np.ndarray, loc_ids: np.ndarray, y: np.ndarray):
+        self.x = torch.from_numpy(x).float()
+        self.loc_ids = torch.from_numpy(loc_ids).long()
+        self.y = torch.from_numpy(y).float()
+
+    def __len__(self):
+        return self.y.shape[0]
+
+    def __getitem__(self, idx):
+        return self.x[idx], self.loc_ids[idx], self.y[idx]
+
+
+def make_lstm_windows(df: pd.DataFrame, feature_cols: list[str], target_col: str, 
+                      lookback: int, horizon: int) -> tuple[np.ndarray, np.ndarray]:
+    """Create sliding windows for LSTM from time series data."""
+    features = df[feature_cols].values.astype(np.float32)
+    target = df[target_col].values.astype(np.float32)
+    
+    X, y = [], []
+    for i in range(len(features) - lookback - horizon + 1):
+        X.append(features[i:i + lookback])
+        y.append(target[i + lookback:i + lookback + horizon])
+    
+    if len(X) == 0:
+        return np.array([]).reshape(0, lookback, len(feature_cols)), np.array([]).reshape(0, horizon)
+    
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+
+
+@torch.no_grad()
+def evaluate_lstm(model, loader, criterion, device, y_mean: float, y_std: float) -> dict:
+    """Evaluate LSTM model."""
+    model.eval()
+    total_loss = 0.0
+    preds = []
+    targets = []
+
+    for xb, yb in loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+        
+        out = model(xb)
+        loss = criterion(out, yb)
+        
+        total_loss += loss.item() * yb.size(0)
+        preds.append(out.detach().cpu().numpy())
+        targets.append(yb.detach().cpu().numpy())
+
+    preds = np.concatenate(preds, axis=0)
+    targets = np.concatenate(targets, axis=0)
+    
+    # Inverse normalize
+    preds_orig = preds * y_std + y_mean
+    targets_orig = targets * y_std + y_mean
+    
+    mse = mean_squared_error(targets_orig, preds_orig)
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(targets_orig, preds_orig))
+    r2 = float(r2_score(targets_orig.flatten(), preds_orig.flatten()))
+    
+    return {
+        "loss": total_loss / len(loader.dataset),
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2,
+        "preds": preds_orig,
+        "targets": targets_orig,
+    }
+
+
+def run_lstm_pipeline(
+    df: pd.DataFrame,
+    selected_location: str,
+    target_col: str,
+    feature_cols: list[str],
+    lookback: int,
+    horizon: int,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    hidden_size: int,
+    num_layers: int,
+    dropout: float,
+    seed: int,
+    use_gpu: bool,
+) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+    """Run LSTM time series forecasting pipeline."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    # Filter by location
+    df_loc = df.loc[df["location_key"].astype(str) == str(selected_location)].copy()
+    if df_loc.empty:
+        raise ValueError(f"No data found for location: {selected_location}")
+    
+    df_loc = df_loc.sort_values("ts_utc").reset_index(drop=True)
+    
+    # Remove NaN values
+    df_loc = df_loc.dropna(subset=feature_cols + [target_col])
+    if len(df_loc) < lookback + horizon:
+        raise ValueError(f"Not enough data for lookback={lookback} and horizon={horizon}")
+    
+    # Normalize features and target
+    X_scaler = StandardScaler()
+    y_scaler = StandardScaler()
+    
+    df_scaled = df_loc.copy()
+    df_scaled[feature_cols] = X_scaler.fit_transform(df_loc[feature_cols])
+    y_scaled_all = y_scaler.fit_transform(df_loc[[target_col]])
+    df_scaled[target_col] = y_scaled_all.flatten()
+    
+    # Create sequences
+    X, y = make_lstm_windows(df_scaled, feature_cols, target_col, lookback, horizon)
+    if len(X) == 0:
+        raise ValueError("Could not create sequences from data")
+    
+    # Train/Val/Test split (70/10/20)
+    n = len(X)
+    train_end = int(0.7 * n)
+    val_end = int(0.8 * n)
+    
+    X_train = X[:train_end]
+    y_train = y[:train_end]
+    X_val = X[train_end:val_end]
+    y_val = y[train_end:val_end]
+    X_test = X[val_end:]
+    y_test = y[val_end:]
+    
+    # Create dataloaders
+    train_ds = SequenceDataset(X_train, y_train)
+    val_ds = SequenceDataset(X_val, y_val)
+    test_ds = SequenceDataset(X_test, y_test)
+    
+    pin_memory = use_gpu and torch.cuda.is_available()
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, pin_memory=pin_memory)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, pin_memory=pin_memory)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, pin_memory=pin_memory)
+    
+    device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
+    
+    # Create model
+    model = LSTMForecaster(
+        input_size=len(feature_cols),
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        horizon=horizon,
+    ).to(device)
+    
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    best_val_loss = float("inf")
+    best_state = None
+    history = []
+    
+    prog = st.progress(0)
+    log_box = st.empty()
+    log_lines = []
+    
+    start_all = time.time()
+    for epoch in range(1, epochs + 1):
+        model.train()
+        running_loss = 0.0
+        epoch_start = time.time()
+        
+        for step, (xb, yb) in enumerate(train_loader, start=1):
+            xb = xb.to(device)
+            yb = yb.to(device)
+            
+            optimizer.zero_grad()
+            out = model(xb)
+            loss = criterion(out, yb)
+            
+            if torch.isfinite(loss):
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item() * yb.size(0)
+        
+        train_loss = running_loss / len(train_ds)
+        val_metrics = evaluate_lstm(model, val_loader, criterion, device, y_scaler.mean_[0], y_scaler.scale_[0])
+        
+        epoch_line = (
+            f"Epoch {epoch}/{epochs} | train_loss={train_loss:.6f} | val_loss={val_metrics['loss']:.6f} | "
+            f"val_mae={val_metrics['mae']:.4f} | val_rmse={val_metrics['rmse']:.4f} | val_r2={val_metrics['r2']:.4f} | "
+            f"sec={time.time() - epoch_start:.1f}"
+        )
+        log_lines.append(epoch_line)
+        log_box.code("\n".join(log_lines[-20:]))
+        
+        prog.progress(epoch / epochs)
+        
+        history.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_metrics["loss"],
+            "val_mae": val_metrics["mae"],
+            "val_rmse": val_metrics["rmse"],
+            "val_r2": val_metrics["r2"],
+        })
+        
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    
+    if best_state is None:
+        raise RuntimeError("No valid checkpoint found during training.")
+    
+    model.load_state_dict(best_state)
+    model.to(device)
+    
+    val_metrics = evaluate_lstm(model, val_loader, criterion, device, y_scaler.mean_[0], y_scaler.scale_[0])
+    test_metrics = evaluate_lstm(model, test_loader, criterion, device, y_scaler.mean_[0], y_scaler.scale_[0])
+    
+    # Create output directory - separate folder for LSTM
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    lstm_run_dir = os.path.join("outputs", "lstm_runs", run_id)
+    os.makedirs(lstm_run_dir, exist_ok=True)
+    
+    # Save model and metrics
+    model_path = os.path.join(lstm_run_dir, "best_lstm.pt")
+    metrics_path = os.path.join(lstm_run_dir, "metrics_history.csv")
+    pred_path = os.path.join(lstm_run_dir, "lstm_predictions.csv")
+    
+    torch.save({
+        "model_state": model.state_dict(),
+        "input_size": len(feature_cols),
+        "hidden_size": hidden_size,
+        "num_layers": num_layers,
+        "dropout": dropout,
+        "horizon": horizon,
+        "lookback": lookback,
+        "feature_cols": feature_cols,
+        "target_col": target_col,
+        "X_scaler": X_scaler,
+        "y_scaler": y_scaler,
+    }, model_path)
+    
+    pd.DataFrame(history).to_csv(metrics_path, index=False)
+    
+    # Create predictions DataFrame
+    pred_df = pd.DataFrame({
+        "actual": test_metrics["targets"].flatten(),
+        "predicted": test_metrics["preds"].flatten(),
+    })
+    pred_df.to_csv(pred_path, index=False)
+    
+    summary = {
+        "model": "lstm",
+        "device": str(device),
+        "lookback": lookback,
+        "horizon": horizon,
+        "val_mae": val_metrics["mae"],
+        "val_rmse": val_metrics["rmse"],
+        "val_r2": val_metrics["r2"],
+        "test_mae": test_metrics["mae"],
+        "test_rmse": test_metrics["rmse"],
+        "test_r2": test_metrics["r2"],
+        "run_sec": time.time() - start_all,
+        "model_path": model_path,
+        "metrics_path": metrics_path,
+        "pred_path": pred_path,
+    }
+    
+    return summary, pd.DataFrame(history), pred_df
+
+
+
     def __init__(self, x: np.ndarray, loc_ids: np.ndarray, y: np.ndarray):
         self.x = torch.from_numpy(x).float()
         self.loc_ids = torch.from_numpy(loc_ids).long()
@@ -830,7 +1139,7 @@ def main():
     col1, col2 = st.columns([2, 1])
     with col1:
         st.subheader("Preview dữ liệu")
-        st.dataframe(df.head(20), use_container_width=True)
+        st.dataframe(df.head(20), width='stretch')
     with col2:
         st.subheader("Thông tin")
         st.write(f"Rows: {len(df):,}")
@@ -940,10 +1249,28 @@ def main():
         help="Khi bật, app sẽ train Mamba + TFT và hiển thị bảng compare test metrics trong cùng run.",
     )
 
+    run1, run2, run3 = st.columns(3)
+    with run1:
+        compare_with_lstm = st.checkbox(
+            "Chạy thêm LSTM để so sánh",
+            value=True,
+            help="Khi bật, app sẽ train LSTM với cùng target location và hiển thị bảng compare.",
+        )
+    with run2:
+        lstm_lookback = st.number_input("LSTM lookback", min_value=1, max_value=168, value=24, step=1)
+    with run3:
+        lstm_hidden = st.number_input("LSTM hidden size", min_value=16, max_value=512, value=64, step=16)
+
+    lstm_col1, lstm_col2 = st.columns(2)
+    with lstm_col1:
+        lstm_num_layers = st.number_input("LSTM num_layers", min_value=1, max_value=8, value=2, step=1)
+        lstm_dropout = st.number_input("LSTM dropout", min_value=0.0, max_value=0.9, value=0.2, format="%.2f")
+
     st.info(
         "Tỉ lệ split cố định theo thời gian: Train 70% | Val 10% | Test 20%. "
         "Không dùng file test.csv riêng; test là các mốc thời gian gần nhất trong dataset tổng."
     )
+
 
     if st.button("Train & Test", type="primary"):
         if len(feature_cols) == 0:
@@ -1001,6 +1328,29 @@ def main():
                             run_dir=run_dir,
                         )
 
+                lstm_summary = None
+                lstm_hist_df = None
+                lstm_pred_df = None
+                if compare_with_lstm:
+                    with st.spinner("Đang chạy LSTM để so sánh..."):
+                        lstm_summary, lstm_hist_df, lstm_pred_df = run_lstm_pipeline(
+                            df=df,
+                            selected_location=selected_location,
+                            target_col=target_col,
+                            feature_cols=feature_cols,
+                            lookback=int(lstm_lookback),
+                            horizon=1,
+                            epochs=int(epochs),
+                            batch_size=int(batch_size),
+                            lr=float(lr),
+                            hidden_size=int(lstm_hidden),
+                            num_layers=int(lstm_num_layers),
+                            dropout=float(lstm_dropout),
+                            seed=int(seed),
+                            use_gpu=bool(use_gpu),
+                        )
+
+
                 summary_df = pd.DataFrame([summary])
 
                 train_counts = (
@@ -1048,7 +1398,7 @@ def main():
             ),
             how="cross",
         )
-        st.dataframe(merged_stats, use_container_width=True)
+        st.dataframe(merged_stats, width='stretch')
 
         st.write("### Thống kê split")
         st.write(
@@ -1064,7 +1414,7 @@ def main():
         )
 
         st.write("### Lịch sử train")
-        st.dataframe(hist_df, use_container_width=True)
+        st.dataframe(hist_df, width='stretch')
 
         if compare_with_tft and tft_summary is not None:
             st.write("### So sánh Mamba vs TFT (test metrics)")
@@ -1087,7 +1437,7 @@ def main():
                     },
                 ]
             )
-            st.dataframe(compare_df, use_container_width=True)
+            st.dataframe(compare_df, width='stretch')
 
             tft_modes_df = pd.DataFrame(
                 [
@@ -1108,18 +1458,69 @@ def main():
                 ]
             )
             st.write("### TFT benchmark modes")
-            st.dataframe(tft_modes_df, use_container_width=True)
+            st.dataframe(tft_modes_df, width='stretch')
 
             if tft_hist_df is not None and not tft_hist_df.empty:
                 st.write("### Lịch sử train TFT")
-                st.dataframe(tft_hist_df, use_container_width=True)
+                st.dataframe(tft_hist_df, width='stretch')
 
             if tft_pred_df is not None and not tft_pred_df.empty:
                 st.write("### TFT predictions preview")
-                st.dataframe(tft_pred_df.head(100), use_container_width=True)
+                st.dataframe(tft_pred_df.head(100), width='stretch')
+
+        if compare_with_lstm and lstm_summary is not None:
+            st.write("### Lịch sử train LSTM")
+            st.dataframe(lstm_hist_df, width='stretch')
+            
+            if lstm_pred_df is not None and not lstm_pred_df.empty:
+                st.write("### LSTM predictions preview")
+                st.dataframe(lstm_pred_df.head(100), width='stretch')
+
+        # ========== 3-MODEL COMPARISON ==========
+        if compare_with_tft and compare_with_lstm and tft_summary is not None and lstm_summary is not None:
+            st.divider()
+            st.write("### 📊 So sánh 3 mô hình (Mamba vs TFT vs LSTM)")
+            st.caption("Đánh giá dựa trên test metrics - tất cả mô hình dùng cùng seed, cùng target location")
+            
+            three_model_df = pd.DataFrame([
+                {
+                    "model": "mamba_best(val)",
+                    "test_mae": summary.get("test_mae", np.nan),
+                    "test_rmse": summary.get("test_rmse", np.nan),
+                    "test_r2": summary.get("test_r2", np.nan),
+                    "run_sec": summary.get("run_sec", np.nan),
+                },
+                {
+                    "model": "tft_best(test_loss)",
+                    "test_mae": tft_summary.get("test_mae", np.nan),
+                    "test_rmse": tft_summary.get("test_rmse", np.nan),
+                    "test_r2": tft_summary.get("test_r2", np.nan),
+                    "run_sec": tft_summary.get("run_sec", np.nan),
+                },
+                {
+                    "model": "lstm_best(val)",
+                    "test_mae": lstm_summary.get("test_mae", np.nan),
+                    "test_rmse": lstm_summary.get("test_rmse", np.nan),
+                    "test_r2": lstm_summary.get("test_r2", np.nan),
+                    "run_sec": lstm_summary.get("run_sec", np.nan),
+                },
+            ])
+            
+            st.dataframe(three_model_df, width='stretch')
+            
+            # Find best model for each metric
+            mae_best = three_model_df.loc[three_model_df["test_mae"].idxmin(), "model"]
+            rmse_best = three_model_df.loc[three_model_df["test_rmse"].idxmin(), "model"]
+            r2_best = three_model_df.loc[three_model_df["test_r2"].idxmax(), "model"]
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Best MAE", mae_best)
+            col2.metric("Best RMSE", rmse_best)
+            col3.metric("Best R²", r2_best)
+
 
         st.write("### Dự báo 24 giờ tiếp theo (từng địa điểm)")
-        st.dataframe(future_df.head(300), use_container_width=True)
+        st.dataframe(future_df.head(300), width='stretch')
         st.download_button(
             "Download file tổng (mọi location)",
             data=future_df.to_csv(index=False).encode("utf-8"),
@@ -1130,7 +1531,7 @@ def main():
         st.info("Đã xuất file riêng cho location đã chọn trong thư mục run, ví dụ: future_24h_predictions_hcm.csv")
         if summary.get("per_location_files"):
             st.write("### Các file đã xuất")
-            st.dataframe(pd.DataFrame({"file": summary["per_location_files"]}), use_container_width=True)
+            st.dataframe(pd.DataFrame({"file": summary["per_location_files"]}), width='stretch')
 
         st.code(
             "\n".join(

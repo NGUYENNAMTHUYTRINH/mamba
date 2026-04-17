@@ -153,7 +153,7 @@ def data_csv_path(exp_name):
         'electricity': './data/electricity/hourly_electricity.csv',
         'traffic': './data/traffic/hourly_data.csv',
         'favorita': './data/favorita/favorita_consolidated.csv',
-        'air_quality': './data/air_quality/air_quality_data.csv',
+        'air_quality': '../dataset/2025.csv',
     }
 
     return csv_map[exp_name]

@@ -14,7 +14,7 @@ import socket
 import random
 import torch
 import numpy as np
-from path import Path
+from pathlib import Path
 from typing import Optional
 import termcolor
 from datetime import datetime
@@ -51,7 +51,7 @@ class Conf(object):
         self.log_each_step = log
 
         # print project name and host name
-        self.project_name = Path(__file__).parent.parent.basename()
+        self.project_name = Path(__file__).parent.parent.name
         m_str = f'┃ {self.project_name}@{Conf.HOSTNAME} ┃'
         u_str = '┏' + '━' * (len(m_str) - 2) + '┓'
         b_str = '┗' + '━' * (len(m_str) - 2) + '┛'
@@ -122,7 +122,7 @@ class Conf(object):
                 continue
             value = self.__dict__[key]
             if type(value) is Path or type(value) is str:
-                value = value.replace(Conf.LOG_PATH, '$LOG_PATH')
+                value = str(value).replace(str(Conf.LOG_PATH), '$LOG_PATH')
                 value = termcolor.colored(value, 'yellow')
             else:
                 value = termcolor.colored(f'{value}', 'magenta')
