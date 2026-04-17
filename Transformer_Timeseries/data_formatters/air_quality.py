@@ -37,12 +37,21 @@ class AirQualityFormatter(GenericDataFormatter):
         ('location_key', DataTypes.CATEGORICAL, InputTypes.STATIC_INPUT),
     ]
 
-    def __init__(self, selected_location=None):
+    def __init__(self, selected_location=None, selected_locations=None):
         self.identifiers = None
         self._global_real_scaler = None
         self._global_target_scaler = None
         self._time_steps = 25 
-        self.selected_location = selected_location
+        if selected_locations is None:
+            if selected_location is None:
+                self.selected_locations = []
+            else:
+                self.selected_locations = [str(selected_location)]
+        elif isinstance(selected_locations, str):
+            self.selected_locations = [x.strip() for x in selected_locations.split(',') if x and x.strip()]
+        else:
+            self.selected_locations = [str(x).strip() for x in selected_locations if str(x).strip()]
+        self.selected_location = self.selected_locations[0] if len(self.selected_locations) == 1 else None
         self.feature_inputs = None
 
     def split_data(self, df):

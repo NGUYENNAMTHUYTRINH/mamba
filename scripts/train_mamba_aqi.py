@@ -391,7 +391,8 @@ def main():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--out-dir", type=str, default="outputs")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu", "auto"])
-    parser.add_argument("--location", type=str, default=None, help="If set, filter data to this location_key and train without location embedding")
+    parser.add_argument("--location", type=str, default=None, help="[Deprecated] Single location_key to filter")
+    parser.add_argument("--locations", type=str, default=None, help="Comma-separated location_key list for multi-location training")
     parser.add_argument("--log-interval", type=int, default=50)
     parser.add_argument("--loss", type=str, default="huber", choices=["mse", "huber"])
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision (recommended on CUDA)")
@@ -409,15 +410,20 @@ def main():
     df = pd.read_csv(args.data_path)
     logger.info("Total rows loaded: %d", len(df))
 
-    # If user requested single-location mode, filter data early so we build samples only for that location
-    if args.location is not None:
-        loc_str = str(args.location)
+    selected_locations = []
+    if args.locations is not None:
+        selected_locations = [x.strip() for x in str(args.locations).split(",") if x and x.strip()]
+    elif args.location is not None:
+        selected_locations = [str(args.location).strip()]
+
+    if selected_locations:
         if "location_key" not in df.columns:
-            raise ValueError("--location specified but dataset has no 'location_key' column")
-        df = df[df["location_key"].astype(str) == loc_str].copy()
+            raise ValueError("--locations/--location specified but dataset has no 'location_key' column")
+        df = df[df["location_key"].astype(str).isin(selected_locations)].copy()
         if df.empty:
-            raise ValueError(f"No rows found for location '{loc_str}' in dataset")
-        logger.info("Filtered dataset to location=%s, rows now: %d", loc_str, len(df))
+            raise ValueError(f"No rows found for selected locations: {selected_locations}")
+        logger.info("Filtered dataset to %d locations: %s", len(selected_locations), selected_locations)
+        logger.info("Rows after location filter: %d", len(df))
 
     x_seq, loc_ids, y, y_ts, num_locations, feature_cols = build_time_series_samples(
         df=df,
@@ -472,20 +478,12 @@ def main():
     logger.info("AMP enabled: %s", use_amp)
     logger.info("Gradient accumulation steps: %d", args.grad_accum_steps)
 
-    if args.location is not None:
-        # single-location mode: use model variant without location embedding
-        model = TimeSeriesMambaRegressorNoLoc(
-            num_features=train.x_seq.shape[-1],
-            d_model=args.d_model,
-            n_layers=args.n_layers,
-        ).to(device)
-    else:
-        model = TimeSeriesMambaRegressor(
-            num_features=train.x_seq.shape[-1],
-            num_locations=num_locations,
-            d_model=args.d_model,
-            n_layers=args.n_layers,
-        ).to(device)
+    model = TimeSeriesMambaRegressor(
+        num_features=train.x_seq.shape[-1],
+        num_locations=num_locations,
+        d_model=args.d_model,
+        n_layers=args.n_layers,
+    ).to(device)
 
     criterion = nn.HuberLoss(delta=1.0) if args.loss == "huber" else nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

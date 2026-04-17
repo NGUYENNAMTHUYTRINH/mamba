@@ -24,16 +24,25 @@ class TSDataset(Dataset):
         
         # Chuyển đổi toàn bộ cột ID từ chữ sang số nguyên (0, 1, 2...)
         le = LabelEncoder()
-        # --- THÊM ĐOẠN CODE NÀY VÀO TRƯỚC ---
-        if hasattr(data_formatter, 'selected_location') and data_formatter.selected_location is not None:
-            self.data = self.data[self.data[id_col].astype(str) == str(data_formatter.selected_location)].copy()
+        selected_locations = []
+        if hasattr(data_formatter, 'selected_locations') and data_formatter.selected_locations is not None:
+            raw = data_formatter.selected_locations
+            if isinstance(raw, str):
+                selected_locations = [x.strip() for x in raw.split(',') if x and x.strip()]
+            else:
+                selected_locations = [str(x).strip() for x in raw if str(x).strip()]
+        elif hasattr(data_formatter, 'selected_location') and data_formatter.selected_location is not None:
+            selected_locations = [str(data_formatter.selected_location).strip()]
+
+        if selected_locations:
+            self.data = self.data[self.data[id_col].astype(str).isin(selected_locations)].copy()
             if self.data.empty:
-                raise ValueError(f"Không có dữ liệu cho địa điểm: {data_formatter.selected_location}")
-        # -----------------------------------
+                raise ValueError(f"Không có dữ liệu cho các địa điểm: {selected_locations}")
 
         # Dòng code cũ của bạn (giữ nguyên):
         self.data[id_col] = le.fit_transform(self.data[id_col].astype(str))
         self.params['num_locations'] = int(self.data[id_col].max()) + 1
+        self.selected_locations = selected_locations
         self.train_set, self.valid_set, self.test_set = data_formatter.split_data(self.data)
         self.params['column_definition'] = data_formatter.get_column_definition()
 
@@ -44,7 +53,8 @@ class TSDataset(Dataset):
 
     def train(self):
         max_samples = self.params['train_samples']
-        cache_path = utils.csv_path_to_folder(self.csv) + "processed_traindata.npz"
+        cache_suffix = self._cache_suffix()
+        cache_path = utils.csv_path_to_folder(self.csv) + f"processed_traindata{cache_suffix}.npz"
         if path.exists(cache_path):
             f = np.load(cache_path, allow_pickle=True)
             self.inputs, self.outputs, self.time, self.identifiers = f[f.files[0]], f[f.files[1]], f[f.files[2]], f[f.files[3]]
@@ -60,7 +70,8 @@ class TSDataset(Dataset):
 
     def test(self):
         max_samples = self.params['test_samples']
-        cache_path = utils.csv_path_to_folder(self.csv) + "processed_testdata.npz"
+        cache_suffix = self._cache_suffix()
+        cache_path = utils.csv_path_to_folder(self.csv) + f"processed_testdata{cache_suffix}.npz"
         if path.exists(cache_path):
             f = np.load(cache_path, allow_pickle=True)
             self.inputs, self.outputs, self.time, self.identifiers = f[f.files[0]], f[f.files[1]], f[f.files[2]], f[f.files[3]]
@@ -76,7 +87,8 @@ class TSDataset(Dataset):
 
     def val(self):
         max_samples = self.params['val_samples']
-        cache_path = utils.csv_path_to_folder(self.csv) + "processed_validdata.npz"
+        cache_suffix = self._cache_suffix()
+        cache_path = utils.csv_path_to_folder(self.csv) + f"processed_validdata{cache_suffix}.npz"
         if path.exists(cache_path):
             f = np.load(cache_path, allow_pickle=True)
             self.inputs, self.outputs, self.time, self.identifiers = f[f.files[0]], f[f.files[1]], f[f.files[2]], f[f.files[3]]
@@ -172,6 +184,13 @@ class TSDataset(Dataset):
     def _get_single_col_by_type(self, input_type):
         """Returns name of single column for input type."""
         return utils.get_single_col_by_input_type(input_type, self.params['column_definition'])
+
+    def _cache_suffix(self):
+        if not self.selected_locations:
+            return ""
+        safe = [str(x).lower().replace(' ', '_').replace('-', '_') for x in self.selected_locations]
+        safe = ["".join([ch for ch in s if ch.isalnum() or ch == '_']) for s in safe]
+        return "_" + "_".join(safe)
 
 
 @click.command()

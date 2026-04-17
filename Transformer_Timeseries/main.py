@@ -11,14 +11,21 @@ from inference import TS
 cudnn.benchmark = True
 
 
+def parse_locations(raw_locations: str | None) -> list[str]:
+    if raw_locations is None:
+        return []
+    return [x.strip() for x in str(raw_locations).split(",") if x and x.strip()]
+
+
 @click.command()
 @click.option('--exp_name', type=str, default=None)
 @click.option('--conf_file_path', type=str, default='conf/air_quality.yaml')
 @click.option('--seed', type=int, default=None)
 @click.option('--inference', type=bool, default=False)
 @click.option('--location', type=str, default=None, help='Nhập mã/tên địa điểm bạn muốn train. Ví dụ: HaNoi') # THÊM OPTION NÀY
-def main(exp_name, conf_file_path, seed, inference, location):
-    # type: (str, str, int, bool, str) -> None
+@click.option('--locations', type=str, default=None, help='Danh sách location ngăn cách bởi dấu phẩy. Ví dụ: HaNoi,HCM,DaNang')
+def main(exp_name, conf_file_path, seed, inference, location, locations):
+    # type: (str, str, int, bool, str, str) -> None
 
     # if `exp_name` is None, ask the user to enter it
     if exp_name is None:
@@ -35,14 +42,19 @@ def main(exp_name, conf_file_path, seed, inference, location):
         exp_name = split[0]
 
     cnf = Conf(conf_file_path=conf_file_path, seed=seed, exp_name=exp_name, log=log_each_step)
-    
-    # Gán biến location vừa nhập từ dòng lệnh vào cấu hình cnf
-    cnf.selected_location = location
+
+    selected_locations = parse_locations(locations)
+    if not selected_locations and location:
+        selected_locations = [str(location).strip()]
+
+    # Backward compatible attrs for other modules.
+    cnf.selected_locations = selected_locations
+    cnf.selected_location = selected_locations[0] if len(selected_locations) == 1 else None
 
     print(f'\n{cnf}')
     print(f"\nStarting Experiment '{exp_name}' [seed: {cnf.seed}]")
-    if location:
-        print(f'Selected Location: {location}')
+    if selected_locations:
+        print(f"Selected Locations ({len(selected_locations)}): {selected_locations}")
 
     if inference:
         ts_model = TS(cnf=cnf)

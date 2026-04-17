@@ -31,14 +31,18 @@ class Trainer(object):
         torch.set_num_threads(3)
 
         self.cnf = cnf
-        
-        # Lấy selected_location từ cấu hình (click truyền vào)
-        loc = getattr(cnf, 'selected_location', None)
+
+        # Read selected locations from CLI config (supports 1 or many).
+        selected_locations = getattr(cnf, 'selected_locations', None)
+        if selected_locations is None:
+            loc = getattr(cnf, 'selected_location', None)
+            selected_locations = [loc] if loc else []
+        self.selected_locations = [str(x) for x in selected_locations if str(x).strip()]
 
         if cnf.ds_name == "air_quality":
             # Nếu chạy air_quality, import class và truyền biến loc vào
             from data_formatters.air_quality import AirQualityFormatter
-            self.data_formatter = AirQualityFormatter(selected_location=loc)
+            self.data_formatter = AirQualityFormatter(selected_locations=self.selected_locations)
         else:
             self.data_formatter = utils.make_data_formatter(cnf.ds_name)
 
@@ -158,10 +162,11 @@ class Trainer(object):
         arr_inv = scaler.inverse_transform(arr_2d)
         return arr_inv.reshape(orig_shape)
 
-    def _save_predictions_csv(self, targets: np.ndarray, preds: np.ndarray):
-        loc_name = getattr(self.cnf, 'selected_location', 'all')
+    def _save_predictions_csv(self, targets: np.ndarray, preds: np.ndarray, loc_ids: np.ndarray):
+        loc_name = "all" if not self.selected_locations else "_".join([str(x) for x in self.selected_locations])
+        loc_name = "".join([ch if ch.isalnum() or ch in ['_', '-'] else '_' for ch in str(loc_name)])
         out_df = pd.DataFrame({
-            "location": [loc_name] * len(preds),
+            "location": loc_ids if loc_ids is not None and len(loc_ids) == len(preds) else [loc_name] * len(preds),
             "actual_aqi": targets,
             "predicted_aqi": preds,
         })
@@ -283,6 +288,7 @@ class Trainer(object):
 
         all_targets = []
         all_preds = []
+        all_loc_ids = []
         mae = np.nan
         rmse = np.nan
         r2 = np.nan
@@ -333,6 +339,14 @@ class Trainer(object):
             # Collect unnormalized targets and predictions for Regression Metrics
             all_targets.append(target.flatten())
             all_preds.append(pred_forecast.flatten())
+            identifiers = sample.get('identifier', None)
+            if identifiers is not None:
+                id_arr = np.array(identifiers, dtype=object)
+                if id_arr.ndim >= 2:
+                    # sample['identifier'] shape is typically (B, pred_len, 1)
+                    id_arr = id_arr[:, -1]
+                id_arr = id_arr.reshape(-1)
+                all_loc_ids.append(id_arr.astype(str))
 
             if self.use_quantile_loss and output.ndim == 3 and output.shape[-1] >= 3:
                 p10_forecast = self._inverse_target(output[..., 0].detach().cpu().numpy())
@@ -390,6 +404,7 @@ class Trainer(object):
             'test_r2': float(r2),
             'all_targets': np.concatenate(all_targets) if len(all_targets) > 0 else np.array([]),
             'all_preds': np.concatenate(all_preds) if len(all_preds) > 0 else np.array([]),
+            'all_loc_ids': np.concatenate(all_loc_ids) if len(all_loc_ids) > 0 else np.array([]),
         }
 
     def run(self):
@@ -409,7 +424,11 @@ class Trainer(object):
                 torch.save(self.model.state_dict(), self.log_path / (self.cnf.exp_name + '_best.pth'))
                 if test_metrics.get('all_targets') is not None and test_metrics.get('all_preds') is not None:
                     if len(test_metrics['all_targets']) > 0 and len(test_metrics['all_preds']) > 0:
-                        self._save_predictions_csv(test_metrics['all_targets'], test_metrics['all_preds'])
+                        self._save_predictions_csv(
+                            test_metrics['all_targets'],
+                            test_metrics['all_preds'],
+                            test_metrics.get('all_loc_ids', np.array([])),
+                        )
             else:
                 self.no_improve_epochs += 1
 
