@@ -17,7 +17,7 @@ class LSTMForecaster(nn.Module):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir", type=str, default="data", help="Directory containing input data files")
+    ap.add_argument("--data-path", type=str, default="dataset/2025.csv", help="Path to input data file (e.g. 2025.csv)")
     ap.add_argument("--target", type=str, default="aqi", help="Target column to predict")
     ap.add_argument("--location", type=str, default=None, help="Filter by a specific location_key")
     ap.add_argument("--model", type=str, default="outputs/best_lstm.pt")
@@ -27,20 +27,19 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
-    csv_files = glob.glob(os.path.join(args.data_dir, "*.csv"))
-    dfs = []
-    
-    for file in csv_files:
-        temp_df = pd.read_csv(file)
-        if "location_key" in temp_df.columns and "ts_utc" in temp_df.columns:
-            temp_df["ts_utc"] = pd.to_datetime(temp_df["ts_utc"])
-            dfs.append(temp_df)
-
-    if not dfs:
-        print("[ERROR] No valid CSV files found in directory.")
+    print(f"[INFO] Loading dataset from: {args.data_path}")
+    try:
+        df = pd.read_csv(args.data_path)
+        if "location_key" in df.columns and "ts_utc" in df.columns:
+            df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True, errors="coerce")
+            df["ts_utc"] = df["ts_utc"].dt.tz_localize(None) 
+        else:
+            print("[ERROR] CSV file missing 'ts_utc' or 'location_key'.")
+            return
+    except Exception as e:
+        print(f"[ERROR] Could not read {args.data_path}: {e}")
         return
 
-    df = pd.concat(dfs, ignore_index=True)
     df.sort_values(by=["location_key", "ts_utc"], inplace=True)
     
     if not args.location:
@@ -81,8 +80,12 @@ def main():
     df_scaled[feature_cols] = X_scaler.transform(df_scaled[feature_cols])
     df_scaled[args.target] = y_scaler.transform(df_scaled[[args.target]])
     
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Evaluating on device: {device}")
+    
     model = LSTMForecaster(input_size=input_size, horizon=args.horizon)
     model.load_state_dict(state["model_state"] if "model_state" in state else state)
+    model.to(device)
     model.eval()
 
     # Create windows for entire set
@@ -97,10 +100,10 @@ def main():
         dates = last_group["ts_utc"].iloc[-args.horizon:].values
         
         feature_slice = last_group[feature_cols].iloc[-args.horizon-args.lookback : -args.horizon]
-        last_input = torch.tensor(feature_slice.values.astype("float32")).unsqueeze(0)
+        last_input = torch.tensor(feature_slice.values.astype("float32")).unsqueeze(0).to(device)
         
         with torch.no_grad():
-            pred_scaled = model(last_input).numpy().flatten()
+            pred_scaled = model(last_input).cpu().numpy().flatten()
             
         pred = y_scaler.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
         y_true = last_group[args.target].iloc[-args.horizon:].values
@@ -117,10 +120,10 @@ def main():
         
         # 3. Predict into the future (e.g. next 24h)
         future_slice = last_group[feature_cols].iloc[-args.lookback:]
-        future_input = torch.tensor(future_slice.values.astype("float32")).unsqueeze(0)
+        future_input = torch.tensor(future_slice.values.astype("float32")).unsqueeze(0).to(device)
         
         with torch.no_grad():
-            future_pred_scaled = model(future_input).numpy().flatten()
+            future_pred_scaled = model(future_input).cpu().numpy().flatten()
         future_pred = y_scaler.inverse_transform(future_pred_scaled.reshape(-1, 1)).flatten()
         
         # Generate future dates

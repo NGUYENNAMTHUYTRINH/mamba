@@ -66,7 +66,7 @@ def plot_forecast(dates, y_true, preds, outpath):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir", type=str, default="data", help="Directory containing input data files (e.g. 2025.csv)")
+    ap.add_argument("--data-path", type=str, default="dataset/2025.csv", help="Path to input data file (e.g. 2025.csv)")
     ap.add_argument("--target", type=str, default="aqi", help="Target column to predict")
     ap.add_argument("--location", type=str, default="all", help="Filter by a specific location_key. Use 'all' to train a global model on all locations.")
     ap.add_argument("--lookback", type=int, default=24, help="Number of time steps to look back (e.g., 24 hours)")
@@ -83,23 +83,18 @@ def main():
     np.random.seed(args.seed)
     os.makedirs(args.outdir, exist_ok=True)
 
-    # 1. Read all CSV files in data directory
-    csv_files = glob.glob(os.path.join(args.data_dir, "*.csv"))
-    dfs = []
-    
-    for file in csv_files:
-        temp_df = pd.read_csv(file)
-        # Verify it has necessary multivariate structure format (location_key, ts_utc)
-        if "location_key" in temp_df.columns and "ts_utc" in temp_df.columns:
-            # Parse dates
-            temp_df["ts_utc"] = pd.to_datetime(temp_df["ts_utc"])
-            dfs.append(temp_df)
-    
-    if not dfs:
-        print("[ERROR] No valid CSV files with 'ts_utc' and 'location_key' found.")
+    # 1. Read CSV file
+    print(f"[INFO] Loading dataset from: {args.data_path}")
+    df = pd.read_csv(args.data_path)
+    if "location_key" in df.columns and "ts_utc" in df.columns:
+        # Parse dates
+        df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True, errors="coerce")
+        # Remove aware timezone if needed to preserve backward compatibility, or just keep it
+        df["ts_utc"] = df["ts_utc"].dt.tz_localize(None) 
+    else:
+        print("[ERROR] CSV file missing 'ts_utc' or 'location_key'.")
         return
 
-    df = pd.concat(dfs, ignore_index=True)
     df.sort_values(by=["location_key", "ts_utc"], inplace=True)
     
     if args.location and args.location.lower() != "all":
@@ -191,12 +186,16 @@ def main():
     print(f"[INFO] Split sizes - Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
 
     # 6. Model definition
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Using device: {device}")
+    
     model = LSTMForecaster(
         input_size=len(feature_cols),
         horizon=args.horizon,
         num_locations=num_locations,
         embed_dim=8
-    )
+    ).to(device)
+    
     opt  = torch.optim.Adam(model.parameters(), lr=args.lr)
     crit = nn.MSELoss()
 
@@ -213,6 +212,10 @@ def main():
         tloss = 0.0
         n = 0
         for xb, lid, yb in tqdm(tr_dl, desc=f"Epoch {ep}/{args.epochs} [train]"):
+            xb, yb = xb.to(device), yb.to(device)
+            if use_embedding:
+                lid = lid.to(device)
+            
             opt.zero_grad()
             preds = model(xb, lid if use_embedding else None)
             loss  = crit(preds, yb)
@@ -228,12 +231,16 @@ def main():
         all_vpreds, all_vtrues = [], []
         with torch.no_grad():
             for xb, lid, yb in tqdm(va_dl, desc=f"Epoch {ep}/{args.epochs} [val]"):
+                xb, yb = xb.to(device), yb.to(device)
+                if use_embedding:
+                    lid = lid.to(device)
+                
                 preds = model(xb, lid if use_embedding else None)
                 loss  = crit(preds, yb)
                 vloss += loss.item() * xb.size(0)
                 vn    += xb.size(0)
-                all_vpreds.append(preds.numpy())
-                all_vtrues.append(yb.numpy())
+                all_vpreds.append(preds.cpu().numpy())
+                all_vtrues.append(yb.cpu().numpy())
         vl = vloss / vn
         
         # Calculate real unscaled metrics for val
@@ -310,20 +317,20 @@ def main():
         if len(loc_group["ts_utc"]) > 1:
             freq = loc_group["ts_utc"].diff().mode().iloc[0]
 
-        # Snap về 0h ngày hôm sau
-        next_day_start = (last_date + pd.Timedelta(days=1)).normalize()
+        # Bắt đầu dự báo ngay từ bước thời gian tiếp theo
+        next_start = last_date + freq
 
         if use_embedding:
-            loc_id_tensor = torch.tensor([loc2id[loc_key]], dtype=torch.long)
+            loc_id_tensor = torch.tensor([loc2id[loc_key]], dtype=torch.long).to(device)
         else:
             loc_id_tensor = None
 
         # Autoregressive loop: dự đoán từng bước một
         future_preds_scaled = []
         for step in range(args.forecast_steps):
-            x_input = torch.tensor(rolling_window).unsqueeze(0)  # (1, lookback, features)
+            x_input = torch.tensor(rolling_window).unsqueeze(0).to(device)  # (1, lookback, features)
             with torch.no_grad():
-                pred_scaled = model(x_input, loc_id_tensor).numpy().flatten()  # (horizon,)
+                pred_scaled = model(x_input, loc_id_tensor).cpu().numpy().flatten()  # (horizon,)
 
             # Chỉ lấy bước đầu tiên (horizon=1 hoặc dùng pred[0] khi horizon>1)
             next_aqi_scaled = float(pred_scaled[0])
@@ -341,7 +348,7 @@ def main():
             np.array(future_preds_scaled).reshape(-1, 1)
         ).flatten()
 
-        future_dates = pd.date_range(start=next_day_start, periods=args.forecast_steps, freq=freq)
+        future_dates = pd.date_range(start=next_start, periods=args.forecast_steps, freq=freq)
 
         f_df = pd.DataFrame({
             "location_key": loc_key,
