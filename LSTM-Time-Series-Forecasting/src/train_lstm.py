@@ -75,6 +75,12 @@ def main():
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--weight-decay", type=float, default=1e-4)
+    ap.add_argument("--loss", type=str, default="huber", choices=["mse", "huber"])
+    ap.add_argument("--amp", action="store_true", help="Enable mixed precision")
+    ap.add_argument("--grad-accum-steps", type=int, default=1)
+    ap.add_argument("--max-grad-norm", type=float, default=1.0)
+    ap.add_argument("--lr-patience", type=int, default=2)
     ap.add_argument("--outdir", type=str, default="outputs")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -196,8 +202,15 @@ def main():
         embed_dim=8
     ).to(device)
     
-    opt  = torch.optim.Adam(model.parameters(), lr=args.lr)
-    crit = nn.MSELoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=args.lr_patience, min_lr=1e-6)
+    
+    if args.loss == "huber":
+        crit = nn.HuberLoss(delta=1.0)
+    else:
+        crit = nn.MSELoss()
+        
+    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
 
     best_val = float("inf")
     stale = 0
@@ -211,16 +224,41 @@ def main():
         model.train()
         tloss = 0.0
         n = 0
-        for xb, lid, yb in tqdm(tr_dl, desc=f"Epoch {ep}/{args.epochs} [train]"):
+        opt.zero_grad(set_to_none=True)
+        amp_enabled = args.amp and device.type == "cuda"
+        
+        for step, (xb, lid, yb) in enumerate(tqdm(tr_dl, desc=f"Epoch {ep}/{args.epochs} [train]"), start=1):
             xb, yb = xb.to(device), yb.to(device)
             if use_embedding:
                 lid = lid.to(device)
-            
-            opt.zero_grad()
-            preds = model(xb, lid if use_embedding else None)
-            loss  = crit(preds, yb)
-            loss.backward()
-            opt.step()
+                
+            with torch.autocast(device_type=(device.type if device.type != "cpu" else "cpu"), dtype=torch.float16, enabled=amp_enabled):
+                preds = model(xb, lid if use_embedding else None)
+                loss  = crit(preds, yb)
+                loss_for_backward = loss / args.grad_accum_steps
+                
+            if not torch.isfinite(loss):
+                opt.zero_grad(set_to_none=True)
+                continue
+                
+            if amp_enabled:
+                scaler.scale(loss_for_backward).backward()
+            else:
+                loss_for_backward.backward()
+                
+            if step % args.grad_accum_steps == 0 or step == len(tr_dl):
+                if amp_enabled:
+                    scaler.unscale_(opt)
+                    if args.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    if args.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    opt.step()
+                opt.zero_grad(set_to_none=True)
+
             tloss += loss.item() * xb.size(0)
             n     += xb.size(0)
         tl = tloss / n
@@ -235,8 +273,10 @@ def main():
                 if use_embedding:
                     lid = lid.to(device)
                 
-                preds = model(xb, lid if use_embedding else None)
-                loss  = crit(preds, yb)
+                with torch.autocast(device_type=(device.type if device.type != "cpu" else "cpu"), dtype=torch.float16, enabled=amp_enabled):
+                    preds = model(xb, lid if use_embedding else None)
+                    loss  = crit(preds, yb)
+                
                 vloss += loss.item() * xb.size(0)
                 vn    += xb.size(0)
                 all_vpreds.append(preds.cpu().numpy())
@@ -263,7 +303,10 @@ def main():
         history["val_mae"].append(v_mae)
         history["val_r2"].append(v_r2)
         history["time_sec"].append(elapsed)
-        print(f"[Epoch {ep}] train_loss={tl:.4f} val_loss={vl:.4f} | val_rmse={v_rmse:.2f} val_mae={v_mae:.2f} val_r2={v_r2:.4f} | {elapsed:.1f}s")
+        current_lr = float(opt.param_groups[0]['lr'])
+        print(f"[Epoch {ep}] train_loss={tl:.4f} val_loss={vl:.4f} | val_rmse={v_rmse:.2f} val_mae={v_mae:.2f} val_r2={v_r2:.4f} | lr={current_lr:.6f} | {elapsed:.1f}s")
+        
+        scheduler.step(vl)
         
         if vl < best_val:
             best_val = vl
@@ -293,7 +336,7 @@ def main():
     pd.DataFrame(history).to_csv(os.path.join(args.outdir, "epoch_metrics.csv"), index=False)
     print("[OK] Training complete. Epoch Metrics saved.")
 
-    state = torch.load(best_path, map_location="cpu")
+    state = torch.load(best_path, map_location="cpu", weights_only=False)
     model.load_state_dict(state["model_state"])
     model.eval()
 
