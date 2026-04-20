@@ -2,6 +2,7 @@
 # ---------------------
 
 from time import time
+import hashlib
 import numpy as np
 import pandas as pd
 import torch
@@ -165,6 +166,15 @@ class Trainer(object):
     def _save_predictions_csv(self, targets: np.ndarray, preds: np.ndarray, loc_ids: np.ndarray):
         loc_name = "all" if not self.selected_locations else "_".join([str(x) for x in self.selected_locations])
         loc_name = "".join([ch if ch.isalnum() or ch in ['_', '-'] else '_' for ch in str(loc_name)])
+        if len(loc_name) > 120:
+            safe_locs = [
+                "".join([ch if ch.isalnum() or ch in ['_', '-'] else '_' for ch in str(x)])
+                for x in self.selected_locations
+            ]
+            digest = hashlib.sha1("|".join(safe_locs).encode("utf-8")).hexdigest()[:12]
+            preview = "_".join(safe_locs[:3])
+            loc_name = f"{preview}_n{len(safe_locs)}_{digest}" if preview else f"all_{digest}"
+
         out_df = pd.DataFrame({
             "location": loc_ids if loc_ids is not None and len(loc_ids) == len(preds) else [loc_name] * len(preds),
             "actual_aqi": targets,

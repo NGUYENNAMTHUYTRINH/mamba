@@ -5,6 +5,7 @@ from data_formatters.base import InputTypes
 from torch.utils.data import Dataset
 import numpy as np
 import click
+import hashlib
 from os import path
 from sklearn.preprocessing import LabelEncoder
 
@@ -190,7 +191,19 @@ class TSDataset(Dataset):
             return ""
         safe = [str(x).lower().replace(' ', '_').replace('-', '_') for x in self.selected_locations]
         safe = ["".join([ch for ch in s if ch.isalnum() or ch == '_']) for s in safe]
-        return "_" + "_".join(safe)
+        raw_suffix = "_" + "_".join(safe)
+
+        # Windows can fail on very long file names when many locations are selected.
+        # Keep short human-readable prefix + stable hash to avoid collisions.
+        if len(raw_suffix) > 120:
+            joined = "|".join(safe)
+            digest = hashlib.sha1(joined.encode("utf-8")).hexdigest()[:12]
+            preview = "_".join(safe[:3])
+            if preview:
+                preview = "_" + preview
+            return f"{preview}_n{len(safe)}_{digest}"
+
+        return raw_suffix
 
 
 @click.command()
