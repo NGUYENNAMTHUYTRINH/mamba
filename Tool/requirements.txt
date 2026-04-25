@@ -1,0 +1,29 @@
+# kafka-python==2.2.15
+# minio==7.1.0
+# psycopg2-binary==2.9.10
+# requests==2.31.0
+# # Logging and utilities
+# python-dateutil==2.8.2
+# # Optional: for enhanced error handling
+# urllib3==2.0.7
+# Xử lý dữ liệu
+pandas
+numpy
+scipy
+matplotlib
+seaborn
+openpyxl
+
+# Machine Learning
+scikit-learn
+
+# Visualization
+plotly
+
+# Storage / API
+minio
+requests
+python-dotenv
+
+# Web app
+streamlit

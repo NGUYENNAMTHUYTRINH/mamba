@@ -1,0 +1,42 @@
+# Docker ignore file for streaming service
+
+# Logs and cache
+logs/
+*.log
+__pycache__/
+*.pyc
+*.pyo
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation and scripts (not needed in container)
+README*.md
+*.sh
+*.bat
+
+# Airflow specific (not needed in streaming container)  
+
+# Docker files (not needed in container)
+docker-compose.yaml
+docker-compose.yml
+
+# --- allow these into Airflow image build ---
+!dags/**
+!plugins/**
+!config/**
+!requirements.airflow.txt
+!pyproject.toml
+!Dockerfile.airflow
+!src/**
