@@ -14,7 +14,10 @@ class TSDataset(Dataset):
 
         self.params = cnf.all_params
 
-        self.csv = utils.data_csv_path(cnf.ds_name)
+        # Truyền override_path từ config (do Pipeline_tft.py set) vào data_csv_path().
+        # Nếu không có hoặc file không tồn tại, fallback về csv_map mặc định.
+        override_path = self.params.get('data_csv_path', None)
+        self.csv = utils.data_csv_path(cnf.ds_name, override_path=override_path)
         self.data = pd.read_csv(self.csv, index_col=0, na_filter=False)
         if 'id' not in self.data.columns:
             self.data.reset_index(inplace=True)

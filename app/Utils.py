@@ -71,17 +71,39 @@ def synthesize_tft_time_from_dataset(repo_root: Path, locations: pd.Series) -> p
 # ---------------------------------------------------------------------------
 
 def load_train_module():
-    """Load động scripts/train_mamba_aqi.py và trả về module.
-    
-    Dùng importlib để tránh xung đột package khi chạy Streamlit.
+    """Load động mamba/train_mamba_aqi.py và trả về module.
+
+    Sau khi tách cấu trúc, file nằm ở:
+        project_root/mamba/train_mamba_aqi.py   (không còn thư mục scripts/)
+
+    Cần thêm project_root vào sys.path để train_mamba_aqi.py tìm được:
+        from core.data_structs import ...
+        from core.metrics import ...
+        from core.utils import ...
+        from mamba.mamba_model import ...
     """
+    import sys
+
     try:
-        # File app/utils.py nằm trong app/, còn scripts/ nằm cùng cấp với app/
-        mod_path = Path(__file__).parent.parent / "mamba" / "scripts" / "train_mamba_aqi.py"
-        spec = importlib.util.spec_from_file_location("train_mamba_aqi_for_streamlit", str(mod_path))
+        project_root = Path(__file__).parent.parent          # app/ -> project root
+        mod_path = project_root / "mamba" / "train_mamba_aqi.py"
+
+        if not mod_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy: {mod_path}")
+
+        # Thêm project_root vào sys.path để các import "from core.xxx" trong
+        # train_mamba_aqi.py hoạt động đúng khi load động bằng importlib.
+        root_str = str(project_root)
+        if root_str not in sys.path:
+            sys.path.insert(0, root_str)
+
+        spec = importlib.util.spec_from_file_location(
+            "train_mamba_aqi_for_streamlit", str(mod_path)
+        )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
+
     except Exception:
         return None
 

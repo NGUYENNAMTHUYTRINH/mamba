@@ -147,13 +147,27 @@ def csv_path_to_folder(path: str):
     return "/".join(path.split('/')[:-1]) + "/"
 
 
-def data_csv_path(exp_name):
+def data_csv_path(exp_name, override_path: str = None):
+    """Trả về đường dẫn CSV cho experiment.
+
+    Ưu tiên:
+      1. override_path nếu được truyền vào và file tồn tại (từ config runtime).
+      2. Biến môi trường DATA_CSV_PATH nếu được set.
+      3. Đường dẫn mặc định theo exp_name (tương đối với cwd).
+    """
+    if override_path and os.path.exists(override_path):
+        return override_path
+
+    env_path = os.environ.get("DATA_CSV_PATH", None)
+    if env_path and os.path.exists(env_path):
+        return env_path
+
     csv_map = {
         'volatility': './data/volatility/formatted_omi_vol.csv',
         'electricity': './data/electricity/hourly_electricity.csv',
         'traffic': './data/traffic/hourly_data.csv',
         'favorita': './data/favorita/favorita_consolidated.csv',
-        'air_quality': '../dataset/2025.csv',
+        'air_quality': './data/2025.csv',
     }
 
     return csv_map[exp_name]

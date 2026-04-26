@@ -42,8 +42,14 @@ def _load_dataset(source: str, data_path: str, uploaded) -> None:
                 st.error("Bạn chưa upload file CSV.")
                 return
             st.session_state["df"] = pd.read_csv(uploaded)
+            # Uploaded file không có đường dẫn thực — TFT sẽ fallback về dataset/2025.csv
+            st.session_state["data_path"] = None
         else:
-            st.session_state["df"] = pd.read_csv(data_path)
+            import os as _os
+            abs_path = _os.path.abspath(data_path)
+            st.session_state["df"] = pd.read_csv(abs_path)
+            # Lưu đường dẫn tuyệt đối để TFT pipeline dùng trực tiếp
+            st.session_state["data_path"] = abs_path
 
         df = st.session_state["df"]
         st.success(
@@ -73,8 +79,9 @@ def render_data_preview(df: pd.DataFrame) -> None:
 # Location selector + sample preview
 # ---------------------------------------------------------------------------
 
-def render_location_selector(df: pd.DataFrame, locations: list[str]) -> list[str]:
+def render_location_selector(df: pd.DataFrame) -> list[str]:
     """Render location multiselect + sample count preview. Trả về selected_locations."""
+    locations = sorted(df["location_key"].dropna().astype(str).unique().tolist()) if "location_key" in df.columns else []
     st.subheader("Chọn địa điểm để train + forecast")
     selected_locations = st.multiselect(
         "Chọn địa điểm để train + forecast",
@@ -145,10 +152,9 @@ def _render_sample_count_preview(
 # Train config form
 # ---------------------------------------------------------------------------
 
-def render_train_config(
-    df: pd.DataFrame,
-) -> dict:
+def render_train_config() -> dict:
     """Render toàn bộ form cấu hình train. Trả về dict config."""
+    df = st.session_state.get("df", pd.DataFrame())
     all_cols = df.columns.tolist()
     reserved_cols = {"y_true", "y_pred", "abs_error"}
     feature_options = [
@@ -225,38 +231,70 @@ def render_train_config(
 # ---------------------------------------------------------------------------
 
 def render_comparison_config() -> dict:
-    """Render checkbox + hyperparams cho TFT và LSTM. Trả về dict config."""
-    compare_with_tft = st.checkbox(
-        "Chạy thêm TFT để so sánh",
-        value=True,
-        help="Train Mamba + TFT và hiển thị bảng compare test metrics trong cùng run.",
-    )
-
-    run1, run2, run3 = st.columns(3)
-    with run1:
-        compare_with_lstm = st.checkbox(
-            "Chạy thêm LSTM để so sánh",
-            value=True,
-            help="Train LSTM với cùng tập locations đã chọn và hiển thị bảng compare.",
-        )
-    with run2:
-        lstm_lookback = st.number_input("LSTM lookback", min_value=1, max_value=168, value=24, step=1)
-    with run3:
-        lstm_hidden = st.number_input("LSTM hidden size", min_value=16, max_value=512, value=64, step=16)
-
-    lstm_col1, lstm_col2 = st.columns(2)
-    with lstm_col1:
-        lstm_num_layers = st.number_input("LSTM num_layers", min_value=1, max_value=8, value=2, step=1)
-        lstm_dropout = st.number_input("LSTM dropout", min_value=0.0, max_value=0.9, value=0.2, format="%.2f")
-
+    """Render checkbox chọn model + hyperparams riêng cho từng model."""
+    st.subheader("Chọn mô hình để huấn luyện")
     st.info(
-        "Tỉ lệ split cố định theo thời gian: Train 70% | Val 10% | Test 20%. "
-        "Test là các mốc thời gian gần nhất trong dataset tổng."
+        "Tích chọn một hoặc nhiều mô hình. "
+        "Tỉ lệ split cố định: Train 70% | Val 10% | Test 20%."
     )
+
+    # ── Checkbox 3 model ────────────────────────────────────────────────────
+    chk1, chk2, chk3 = st.columns(3)
+    with chk1:
+        run_mamba = st.checkbox("🟣 Mamba", value=True,
+                                help="Huấn luyện Mamba SSM.")
+    with chk2:
+        run_tft = st.checkbox("🔵 TFT (Transformer)", value=False,
+                              help="Huấn luyện Temporal Fusion Transformer.")
+    with chk3:
+        run_lstm = st.checkbox("🟢 LSTM", value=False,
+                               help="Huấn luyện LSTM baseline.")
+
+    # ── Hyperparams Mamba (chỉ hiện khi được chọn) ─────────────────────────
+    mamba_lookback, mamba_d_model, mamba_n_layers = 24, 64, 2
+    if run_mamba:
+        with st.expander("⚙️ Cấu hình Mamba", expanded=False):
+            mc1, mc2, mc3 = st.columns(3)
+            with mc1:
+                mamba_lookback = st.number_input("Lookback (timesteps)", min_value=1, max_value=168, value=24, step=1, key="mamba_lookback")
+            with mc2:
+                mamba_d_model = st.number_input("d_model", min_value=16, max_value=512, value=64, step=16, key="mamba_d_model")
+            with mc3:
+                mamba_n_layers = st.number_input("n_layers", min_value=1, max_value=8, value=2, step=1, key="mamba_n_layers")
+
+    # ── Hyperparams TFT (chỉ hiện khi được chọn) ───────────────────────────
+    tft_lookback, tft_hidden = 24, 64
+    if run_tft:
+        with st.expander("⚙️ Cấu hình TFT", expanded=False):
+            tc1, tc2 = st.columns(2)
+            with tc1:
+                tft_lookback = st.number_input("Lookback (timesteps)", min_value=1, max_value=168, value=24, step=1, key="tft_lookback")
+            with tc2:
+                tft_hidden = st.number_input("Hidden size", min_value=16, max_value=512, value=64, step=16, key="tft_hidden")
+
+    # ── Hyperparams LSTM (chỉ hiện khi được chọn) ──────────────────────────
+    lstm_lookback, lstm_hidden, lstm_num_layers, lstm_dropout = 24, 64, 2, 0.2
+    if run_lstm:
+        with st.expander("⚙️ Cấu hình LSTM", expanded=False):
+            lc1, lc2, lc3, lc4 = st.columns(4)
+            with lc1:
+                lstm_lookback = st.number_input("Lookback", min_value=1, max_value=168, value=24, step=1, key="lstm_lookback")
+            with lc2:
+                lstm_hidden = st.number_input("Hidden size", min_value=16, max_value=512, value=64, step=16, key="lstm_hidden")
+            with lc3:
+                lstm_num_layers = st.number_input("Num layers", min_value=1, max_value=8, value=2, step=1, key="lstm_num_layers")
+            with lc4:
+                lstm_dropout = st.number_input("Dropout", min_value=0.0, max_value=0.9, value=0.2, format="%.2f", key="lstm_dropout")
 
     return dict(
-        compare_with_tft=bool(compare_with_tft),
-        compare_with_lstm=bool(compare_with_lstm),
+        run_mamba=bool(run_mamba),
+        run_tft=bool(run_tft),
+        run_lstm=bool(run_lstm),
+        mamba_lookback=int(mamba_lookback),
+        mamba_d_model=int(mamba_d_model),
+        mamba_n_layers=int(mamba_n_layers),
+        tft_lookback=int(tft_lookback),
+        tft_hidden=int(tft_hidden),
         lstm_lookback=int(lstm_lookback),
         lstm_hidden=int(lstm_hidden),
         lstm_num_layers=int(lstm_num_layers),
@@ -386,69 +424,61 @@ def render_lstm_results(lstm_hist_df: pd.DataFrame | None, lstm_pred_df: pd.Data
 
 
 def render_comparison_table(
-    summary: dict,
+    summary: dict | None,
     tft_summary: dict | None,
     lstm_summary: dict | None,
 ) -> None:
-    """Hiển thị bảng so sánh 2 hoặc 3 model."""
-    rows = [
-        {
-            "model": "mamba_best(val)",
-            "test_mae": summary.get("test_mae", np.nan),
-            "test_rmse": summary.get("test_rmse", np.nan),
-            "test_r2": summary.get("test_r2", np.nan),
+    """Hiển thị bảng so sánh các model đã chạy (bỏ qua model None)."""
+    rows = []
+
+    if summary is not None:
+        rows.append({
+            "model": "Mamba",
+            "test_mae":  summary.get("test_mae",       np.nan),
+            "test_rmse": summary.get("test_rmse",      np.nan),
+            "test_r2":   summary.get("test_r2",        np.nan),
             "train_sec": summary.get("train_only_sec", np.nan),
-            "run_sec": summary.get("run_sec", np.nan),
-        }
-    ]
+            "run_sec":   summary.get("run_sec",        np.nan),
+        })
 
     if tft_summary is not None:
-        st.write("### So sánh Mamba vs TFT (test metrics)")
-        st.caption(
-            "Benchmark chuẩn: cùng loss, cùng seed; "
-            "Mamba dùng best checkpoint theo val, TFT dùng best epoch theo test_loss."
-        )
-        rows.append(
-            {
-                "model": "tft_best(test_loss)",
-                "test_mae": tft_summary.get("test_mae", np.nan),
-                "test_rmse": tft_summary.get("test_rmse", np.nan),
-                "test_r2": tft_summary.get("test_r2", np.nan),
-                "train_sec": tft_summary.get("train_only_sec", np.nan),
-                "run_sec": tft_summary.get("run_sec", np.nan),
-            }
-        )
-        st.dataframe(pd.DataFrame(rows[:2]), use_container_width=True)
+        rows.append({
+            "model": "TFT",
+            "test_mae":  tft_summary.get("test_mae",       np.nan),
+            "test_rmse": tft_summary.get("test_rmse",      np.nan),
+            "test_r2":   tft_summary.get("test_r2",        np.nan),
+            "train_sec": tft_summary.get("train_only_sec", np.nan),
+            "run_sec":   tft_summary.get("run_sec",        np.nan),
+        })
 
     if lstm_summary is not None:
-        rows.append(
-            {
-                "model": "lstm_best(val)",
-                "test_mae": lstm_summary.get("test_mae", np.nan),
-                "test_rmse": lstm_summary.get("test_rmse", np.nan),
-                "test_r2": lstm_summary.get("test_r2", np.nan),
-                "train_sec": lstm_summary.get("train_only_sec", np.nan),
-                "run_sec": lstm_summary.get("run_sec", np.nan),
-            }
-        )
+        rows.append({
+            "model": "LSTM",
+            "test_mae":  lstm_summary.get("test_mae",       np.nan),
+            "test_rmse": lstm_summary.get("test_rmse",      np.nan),
+            "test_r2":   lstm_summary.get("test_r2",        np.nan),
+            "train_sec": lstm_summary.get("train_only_sec", np.nan),
+            "run_sec":   lstm_summary.get("run_sec",        np.nan),
+        })
 
-    if tft_summary is not None and lstm_summary is not None:
-        st.divider()
-        st.write("### 📊 So sánh 3 mô hình (Mamba vs TFT vs LSTM)")
-        st.caption(
-            "Đánh giá dựa trên test metrics - tất cả mô hình dùng cùng seed, cùng tập locations"
-        )
-        three_df = pd.DataFrame(rows)
-        st.dataframe(three_df, use_container_width=True)
+    if len(rows) < 1:
+        return  # chưa có kết quả nào để so sánh
 
-        mae_best = three_df.loc[three_df["test_mae"].idxmin(), "model"]
-        rmse_best = three_df.loc[three_df["test_rmse"].idxmin(), "model"]
-        r2_best = three_df.loc[three_df["test_r2"].idxmax(), "model"]
+    st.divider()
+    st.write(f"### 📊 So sánh {len(rows)} mô hình")
+    st.caption("Đánh giá trên test set — cùng seed, cùng tập locations.")
 
+    cmp_df = pd.DataFrame(rows)
+    st.dataframe(cmp_df, use_container_width=True)
+
+    if len(rows) >= 2:
+        mae_best  = cmp_df.loc[cmp_df["test_mae"].idxmin(),  "model"]
+        rmse_best = cmp_df.loc[cmp_df["test_rmse"].idxmin(), "model"]
+        r2_best   = cmp_df.loc[cmp_df["test_r2"].idxmax(),   "model"]
         col1, col2, col3 = st.columns(3)
-        col1.metric("Best MAE", mae_best)
+        col1.metric("Best MAE",  mae_best)
         col2.metric("Best RMSE", rmse_best)
-        col3.metric("Best R²", r2_best)
+        col3.metric("Best R²",   r2_best)
 
 
 def render_forecast_download(future_df: pd.DataFrame, summary: dict) -> None:

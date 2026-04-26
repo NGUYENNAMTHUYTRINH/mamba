@@ -173,7 +173,6 @@ class AirQualityFormatter(GenericDataFormatter):
 
     def transform_inputs(self, df):
         df = df.copy()
-        
         column_definitions = self.get_column_definition()
         id_col = utils.get_single_col_by_input_type(InputTypes.ID, column_definitions)
         time_col = utils.get_single_col_by_input_type(InputTypes.TIME, column_definitions)

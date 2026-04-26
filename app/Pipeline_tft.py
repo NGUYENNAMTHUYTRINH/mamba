@@ -57,6 +57,7 @@ def run_tft_pipeline(
     cfg["model"] = "tf_transformer"
     cfg["num_epochs"] = int(epochs)
     cfg["batch_size"] = int(batch_size)
+    cfg["n_batch_size"] = int(batch_size)
     cfg["lr"] = float(lr)
     cfg["weight_decay"] = float(weight_decay)
     cfg["loss"] = str(loss_name)
@@ -65,6 +66,16 @@ def run_tft_pipeline(
     cfg["point_forecast"] = True
     cfg["use_quantile_loss_for_tft"] = False
     cfg["quantiles"] = [0.5]
+
+    # Truyền đường dẫn CSV tuyệt đối vào config để TFT không dùng đường dẫn cứng.
+    # Ưu tiên: (1) path từ session_state nếu user upload/chọn, (2) fallback về dataset/2025.csv
+    import streamlit as _st
+    _ss_path = _st.session_state.get("data_path", None)
+    if _ss_path and Path(str(_ss_path)).exists():
+        cfg["data_csv_path"] = str(Path(_ss_path).resolve())
+    else:
+        default_csv = repo_root / "dataset" / "2025.csv"
+        cfg["data_csv_path"] = str(default_csv.resolve())
 
     run_dir_abs = Path(run_dir).resolve()
     os.makedirs(run_dir_abs, exist_ok=True)
