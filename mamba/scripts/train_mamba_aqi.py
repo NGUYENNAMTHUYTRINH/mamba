@@ -37,10 +37,17 @@ class AQIDataset(Dataset):
 
 
 class TimeSeriesMambaRegressor(nn.Module):
-    def __init__(self, num_features: int, num_locations: int, d_model: int = 64, n_layers: int = 2):
+    def __init__(
+        self,
+        num_features: int,
+        num_locations: int,
+        d_model: int = 64,
+        n_layers: int = 2,
+        loc_embed_dim: int = 8,
+    ):
         super().__init__()
-        self.feature_proj = nn.Linear(num_features, d_model)
-        self.location_emb = nn.Embedding(num_locations, d_model)
+        self.location_emb = nn.Embedding(num_locations, loc_embed_dim)
+        self.feature_proj = nn.Linear(num_features + loc_embed_dim, d_model)
         self.layers = nn.ModuleList(
             [
                 Mamba(
@@ -61,11 +68,16 @@ class TimeSeriesMambaRegressor(nn.Module):
         )
         self.num_features = num_features
 
-    def forward(self, x_seq: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
+    def concat_location(self, x_seq: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
         # x_seq: (B, T, F)
-        x = self.feature_proj(x_seq)  # (B, T, d_model)
-        loc_token = self.location_emb(loc_ids).unsqueeze(1)  # (B, 1, d_model)
-        x = torch.cat([loc_token, x], dim=1)  # (B, T+1, d_model)
+        loc_vec = self.location_emb(loc_ids).unsqueeze(1)  # (B, 1, E)
+        loc_vec = loc_vec.expand(-1, x_seq.size(1), -1)  # (B, T, E)
+        x = torch.cat([x_seq, loc_vec], dim=-1)  # (B, T, F+E)
+        return self.feature_proj(x)  # (B, T, d_model)
+
+    def forward(self, x_seq: torch.Tensor) -> torch.Tensor:
+        # x_seq: (B, T, d_model)
+        x = x_seq
 
         for layer in self.layers:
             x = layer(x)
@@ -203,9 +215,12 @@ class TimeSeriesMambaRegressorNoLoc(nn.Module):
             nn.Linear(d_model, 1),
         )
 
-    def forward(self, x_seq: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
-        # x_seq: (B, T, F)
-        x = self.feature_proj(x_seq)  # (B, T, d_model)
+    def concat_location(self, x_seq: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
+        return self.feature_proj(x_seq)  # (B, T, d_model)
+
+    def forward(self, x_seq: torch.Tensor) -> torch.Tensor:
+        # x_seq: (B, T, d_model)
+        x = x_seq
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x)
@@ -288,9 +303,10 @@ def run_epoch(
         x_seq = x_seq.to(device)
         loc_ids = loc_ids.to(device)
         y = y.to(device)
+        x_seq = model.concat_location(x_seq, loc_ids)
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-            pred = model(x_seq, loc_ids)
+            pred = model(x_seq)
             loss = criterion(pred, y)
             loss_for_backward = loss / grad_accum_steps
 
@@ -348,9 +364,10 @@ def evaluate(model, loader, criterion, device, use_amp, y_mean, y_std):
         x_seq = x_seq.to(device)
         loc_ids = loc_ids.to(device)
         y = y.to(device)
+        x_seq = model.concat_location(x_seq, loc_ids)
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-            pred = model(x_seq, loc_ids)
+            pred = model(x_seq)
             loss = criterion(pred, y)
 
         total_loss += loss.item() * y.size(0)

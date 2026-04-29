@@ -105,6 +105,8 @@ def run_tft_pipeline(
     """
     repo_root = Path(__file__).parent
     tft_root = repo_root / "Transformer_Timeseries"
+    if not tft_root.exists():
+        tft_root = repo_root.parent / "Transformer_Timeseries"
     base_conf_path = tft_root / "conf" / "air_quality.yaml"
     if not base_conf_path.exists():
         raise FileNotFoundError(f"Không tìm thấy config TFT: {base_conf_path}")
@@ -394,17 +396,20 @@ class LSTMForecaster(nn.Module):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
 
-    def forward(self, x: torch.Tensor, loc_ids: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        x: (B, T, input_size)
-        output: (B, horizon)
-        """
+    def concat_location(self, x: torch.Tensor, loc_ids: torch.Tensor | None) -> torch.Tensor:
         if self.use_embedding:
             if loc_ids is None:
                 raise ValueError("loc_ids is required when location embedding is enabled")
             loc_vec = self.location_emb(loc_ids)  # (B, E)
             loc_vec = loc_vec.unsqueeze(1).expand(-1, x.size(1), -1)  # (B, T, E)
-            x = torch.cat([x, loc_vec], dim=-1)
+            return torch.cat([x, loc_vec], dim=-1)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, T, input_size + loc_embed_dim)
+        output: (B, horizon)
+        """
         out, _ = self.lstm(x)
         h_last = out[:, -1, :]  # (B, hidden_size)
         return self.fc(h_last)
@@ -455,7 +460,8 @@ def evaluate_lstm(model, loader, criterion, device, y_mean: float, y_std: float)
         loc_ids = loc_ids.to(device)
         yb = yb.to(device)
         
-        out = model(xb, loc_ids)
+        xb = model.concat_location(xb, loc_ids)
+        out = model(xb)
         loss = criterion(out, yb)
         
         total_loss += loss.item() * yb.size(0)
@@ -632,7 +638,8 @@ def run_lstm_pipeline(
             yb = yb.to(device)
             
             optimizer.zero_grad()
-            out = model(xb, lid)
+            xb = model.concat_location(xb, lid)
+            out = model(xb)
             loss = criterion(out, yb)
             
             if torch.isfinite(loss):
@@ -1037,7 +1044,8 @@ def evaluate(model, loader, criterion, device, y_mean, y_std):
         loc_ids = loc_ids.to(device)
         yb = yb.to(device)
 
-        out = model(xb, loc_ids)
+        xb = model.concat_location(xb, loc_ids)
+        out = model(xb)
         loss = criterion(out, yb)
 
         total_loss += loss.item() * yb.size(0)
@@ -1198,7 +1206,8 @@ def train_pipeline(
             yb = yb.to(device, non_blocking=pin_memory)
 
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-                out = model(xb, loc_batch)
+                xb = model.concat_location(xb, loc_batch)
+                out = model(xb)
                 loss = criterion(out, yb)
 
             if not torch.isfinite(loss):
@@ -1354,7 +1363,8 @@ def train_pipeline(
             x_all = torch.from_numpy(np.stack(infer_x, axis=0)).to(device, non_blocking=pin_memory)
             loc_all = torch.tensor(infer_loc, dtype=torch.long, device=device)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-                pred_norm_all = model(x_all, loc_all).detach().float().cpu().numpy()
+                x_all = model.concat_location(x_all, loc_all)
+                pred_norm_all = model(x_all).detach().float().cpu().numpy()
 
             pred_all = pred_norm_all * y_std + y_mean
             for (ts_val, loc_val), pred_val in zip(infer_meta, pred_all):
