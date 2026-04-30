@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import os
 import sys
+import shutil
+import tempfile
+from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -17,6 +20,9 @@ import streamlit as st
 
 from Utils import load_train_module, split_data_by_timeline
 
+# Thư mục lưu tạm file upload (nằm cạnh app/)
+_UPLOAD_TEMP_DIR = Path(__file__).parent.parent / "runs" / "uploaded"
+
 
 # ---------------------------------------------------------------------------
 # Sidebar & dataset loading
@@ -25,38 +31,124 @@ from Utils import load_train_module, split_data_by_timeline
 def render_sidebar() -> tuple[str, str, object | None]:
     """Render sidebar nguồn dữ liệu, trả về (source, data_path, uploaded_file)."""
     with st.sidebar:
-        st.header("Nguồn dữ liệu")
-        source = st.radio("Dataset source", ["workspace path", "upload csv"], index=0)
-        data_path = st.text_input("Path CSV trong workspace", value="dataset/2025.csv")
-        uploaded = st.file_uploader("Hoặc upload CSV", type=["csv"])
-        if st.button("Load dataset"):
-            _load_dataset(source, data_path, uploaded)
+        st.header("📂 Nguồn dữ liệu")
+
+        # ── Trạng thái dataset hiện tại ─────────────────────────────────────
+        _active_path = st.session_state.get("data_path", None)
+        _active_df   = st.session_state.get("df", None)
+        if _active_df is not None and _active_path:
+            st.success(
+                f"✅ Dataset đang dùng:\n"
+                f"`{Path(_active_path).name}`\n"
+                f"{_active_df.shape[0]:,} rows · {_active_df.shape[1]} cols"
+            )
+        elif _active_df is not None:
+            st.info(
+                f"📄 Dataset đang dùng: *(file upload tạm)*\n"
+                f"{_active_df.shape[0]:,} rows · {_active_df.shape[1]} cols"
+            )
+        else:
+            st.warning("⚠️ Chưa load dataset. Hãy chọn nguồn bên dưới và nhấn **Load**.")
+
+        st.divider()
+
+        # ── Chọn nguồn ──────────────────────────────────────────────────────
+        source = st.radio(
+            "Nguồn dataset",
+            ["📁 Đường dẫn trong workspace", "⬆️ Upload file CSV"],
+            index=0,
+            help="Chọn cách cung cấp file CSV đầu vào cho tất cả các model (Mamba, TFT, LSTM).",
+        )
+        use_upload = source.startswith("⬆️")
+
+        data_path = ""
+        uploaded  = None
+
+        if not use_upload:
+            data_path = st.text_input(
+                "Path CSV (tương đối hoặc tuyệt đối)",
+                value=st.session_state.get("_sidebar_path_input", "dataset/2025.csv"),
+                help="Ví dụ: dataset/2025.csv  hoặc  D:/data/myfile.csv",
+                key="_sidebar_path_input",
+            )
+            st.caption(f"📌 Thư mục gốc: `{Path.cwd()}`")
+        else:
+            uploaded = st.file_uploader(
+                "Chọn file CSV để upload",
+                type=["csv"],
+                help="File sẽ được lưu tạm vào thư mục `runs/uploaded/` để TFT có thể đọc.",
+            )
+            if uploaded is not None:
+                st.caption(f"📎 File đã chọn: **{uploaded.name}** ({uploaded.size / 1024:.1f} KB)")
+
+        # ── Nút Load / Reset ─────────────────────────────────────────────────
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            load_clicked = st.button("⬇️ Load", use_container_width=True, type="primary")
+        with btn_col2:
+            reset_clicked = st.button("🗑️ Reset", use_container_width=True)
+
+        if reset_clicked:
+            for key in ["df", "data_path", "_upload_saved_path"]:
+                st.session_state.pop(key, None)
+            st.rerun()
+
+        if load_clicked:
+            _load_dataset(use_upload, data_path, uploaded)
+
     return source, data_path, uploaded
 
 
-def _load_dataset(source: str, data_path: str, uploaded) -> None:
-    """Load dataset vào session_state['df']."""
+def _load_dataset(use_upload: bool, data_path: str, uploaded) -> None:
+    """Load dataset vào session_state['df'] và lưu path tuyệt đối vào session_state['data_path']."""
     try:
-        if source == "upload csv":
+        if use_upload:
+            # ── Trường hợp upload file ──────────────────────────────────────
             if uploaded is None:
-                st.error("Bạn chưa upload file CSV.")
+                st.sidebar.error("❌ Bạn chưa chọn file CSV để upload.")
                 return
-            st.session_state["df"] = pd.read_csv(uploaded)
-            # Uploaded file không có đường dẫn thực — TFT sẽ fallback về dataset/2025.csv
-            st.session_state["data_path"] = None
+
+            # Lưu file tạm ra disk để TFT subprocess đọc được đường dẫn thực
+            _UPLOAD_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+            saved_path = _UPLOAD_TEMP_DIR / uploaded.name
+            with open(saved_path, "wb") as f:
+                f.write(uploaded.getbuffer())
+
+            df = pd.read_csv(saved_path)
+            st.session_state["df"]              = df
+            st.session_state["data_path"]       = str(saved_path.resolve())
+            st.session_state["_upload_saved_path"] = str(saved_path.resolve())
+
+            st.sidebar.success(
+                f"✅ Upload thành công: **{uploaded.name}**\n"
+                f"{df.shape[0]:,} rows · {df.shape[1]} cols"
+            )
+
         else:
-            import os as _os
-            abs_path = _os.path.abspath(data_path)
-            st.session_state["df"] = pd.read_csv(abs_path)
-            # Lưu đường dẫn tuyệt đối để TFT pipeline dùng trực tiếp
+            # ── Trường hợp nhập đường dẫn ───────────────────────────────────
+            if not data_path or not data_path.strip():
+                st.sidebar.error("❌ Đường dẫn CSV không được để trống.")
+                return
+
+            abs_path = str(Path(data_path.strip()).resolve())
+            if not Path(abs_path).exists():
+                st.sidebar.error(
+                    f"❌ Không tìm thấy file:\n`{abs_path}`\n\n"
+                    "Hãy kiểm tra lại đường dẫn hoặc dùng đường dẫn tuyệt đối."
+                )
+                return
+
+            df = pd.read_csv(abs_path)
+            st.session_state["df"]        = df
             st.session_state["data_path"] = abs_path
 
-        df = st.session_state["df"]
-        st.success(
-            f"Load thành công dataset: {df.shape[0]:,} rows, {df.shape[1]} cols"
-        )
+            st.sidebar.success(
+                f"✅ Load thành công: **{Path(abs_path).name}**\n"
+                f"{df.shape[0]:,} rows · {df.shape[1]} cols"
+            )
+
     except Exception as e:
-        st.error(f"Load dataset lỗi: {e}")
+        st.sidebar.error(f"❌ Load dataset lỗi: {e}")
 
 
 # ---------------------------------------------------------------------------

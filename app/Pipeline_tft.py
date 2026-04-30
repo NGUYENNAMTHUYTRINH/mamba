@@ -67,15 +67,20 @@ def run_tft_pipeline(
     cfg["use_quantile_loss_for_tft"] = False
     cfg["quantiles"] = [0.5]
 
-    # Truyền đường dẫn CSV tuyệt đối vào config để TFT không dùng đường dẫn cứng.
-    # Ưu tiên: (1) path từ session_state nếu user upload/chọn, (2) fallback về dataset/2025.csv
+    # ── Xác định đường dẫn CSV đầu vào ──────────────────────────────────
+    # ưu tiên: session_state["data_path"] (có thể từ path nhập tay hoặc file upload tạm)
     import streamlit as _st
     _ss_path = _st.session_state.get("data_path", None)
     if _ss_path and Path(str(_ss_path)).exists():
         cfg["data_csv_path"] = str(Path(_ss_path).resolve())
+        print(f"[TFT] Sử dụng CSV từ session_state: {cfg['data_csv_path']}")
     else:
+        # Fallback về file mặc định trong thư mục dataset/
         default_csv = repo_root / "dataset" / "2025.csv"
         cfg["data_csv_path"] = str(default_csv.resolve())
+        if _ss_path:
+            print(f"[TFT] Cảnh báo: session_state['data_path'] = '{_ss_path}' không tồn tại.")
+        print(f"[TFT] Sử dụng CSV mặc định (fallback): {cfg['data_csv_path']}")
 
     run_dir_abs = Path(run_dir).resolve()
     os.makedirs(run_dir_abs, exist_ok=True)
