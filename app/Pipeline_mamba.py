@@ -18,9 +18,8 @@ import pandas as pd
 import streamlit as st
 import torch
 import torch.nn as nn
-from mamba_ssm import Mamba
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 from Utils import (
     build_future_24h_frame,
@@ -29,67 +28,6 @@ from Utils import (
     normalize_locations,
     split_data_by_timeline,
 )
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
-class TabularDataset(Dataset):
-    """Dataset cho Mamba tabular forecasting."""
-
-    def __init__(self, x: np.ndarray, loc_ids: np.ndarray, y: np.ndarray):
-        self.x = torch.from_numpy(x).float()
-        self.loc_ids = torch.from_numpy(loc_ids).long()
-        self.y = torch.from_numpy(y).float()
-
-    def __len__(self) -> int:
-        return self.y.shape[0]
-
-    def __getitem__(self, idx):
-        return self.x[idx], self.loc_ids[idx], self.y[idx]
-
-
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-
-class TabularMambaRegressor(nn.Module):
-    """Mamba-based tabular regressor với location embedding."""
-
-    def __init__(
-        self,
-        num_features: int,
-        num_locations: int,
-        d_model: int = 64,
-        n_layers: int = 2,
-    ):
-        super().__init__()
-        self.scalar_proj = nn.Linear(1, d_model)
-        self.location_emb = nn.Embedding(num_locations, d_model)
-        self.layers = nn.ModuleList(
-            [
-                Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2, use_fast_path=False)
-                for _ in range(n_layers)
-            ]
-        )
-        self.norm = nn.LayerNorm(d_model)
-        self.head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, 1),
-        )
-        self.num_features = num_features
-
-    def forward(self, x_num: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
-        # x_num: (B, F)
-        x = self.scalar_proj(x_num.unsqueeze(-1))  # (B, F, d_model)
-        loc_token = self.location_emb(loc_ids).unsqueeze(1)  # (B, 1, d_model)
-        x = torch.cat([loc_token, x], dim=1)  # (B, F+1, d_model)
-        for layer in self.layers:
-            x = layer(x)
-        x = self.norm(x)
-        return self.head(x.mean(dim=1)).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------

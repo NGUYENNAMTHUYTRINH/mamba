@@ -97,6 +97,11 @@ def load_train_module():
         if root_str not in sys.path:
             sys.path.insert(0, root_str)
 
+        # Thêm thư mục mamba để import trực tiếp mamba_ssm (local source).
+        mamba_str = str(project_root / "mamba")
+        if mamba_str not in sys.path:
+            sys.path.insert(0, mamba_str)
+
         spec = importlib.util.spec_from_file_location(
             "train_mamba_aqi_for_streamlit", str(mod_path)
         )

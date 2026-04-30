@@ -25,19 +25,20 @@ class TimeSeriesMambaRegressor(nn.Module):
 
     Flow:
         x_seq (B, T, F)
-        → feature_proj (B, T, d_model)
-        → cat với loc_token (B, 1, d_model) → (B, T+1, d_model)
+        → concat location embedding per-timestep → (B, T, F + E)
+        → input_proj → (B, T, d_model)
         → n_layers Mamba blocks
         → LayerNorm
-        → lấy last token (B, d_model)
+        → lấy last timestep (B, d_model)
         → head MLP → scalar (B,)
 
     Parameters
     ----------
-    num_features  : số lượng feature đầu vào (F)
-    num_locations : số lượng location (dùng cho Embedding)
-    d_model       : chiều ẩn của Mamba
-    n_layers      : số Mamba block xếp chồng
+    num_features   : số lượng feature đầu vào (F)
+    num_locations  : số lượng location (dùng cho Embedding)
+    d_model        : chiều ẩn của Mamba
+    n_layers       : số Mamba block xếp chồng
+    loc_embed_dim  : chiều embedding cho location
     """
 
     def __init__(
@@ -46,10 +47,11 @@ class TimeSeriesMambaRegressor(nn.Module):
         num_locations: int,
         d_model:  int = 64,
         n_layers: int = 2,
+        loc_embed_dim: int = 8,
     ) -> None:
         super().__init__()
-        self.feature_proj  = nn.Linear(num_features, d_model)
-        self.location_emb  = nn.Embedding(num_locations, d_model)
+        self.location_emb = nn.Embedding(num_locations, loc_embed_dim)
+        self.input_proj = nn.Linear(num_features + loc_embed_dim, d_model)
         self.layers = nn.ModuleList([
             Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2, use_fast_path=False)
             for _ in range(n_layers)
@@ -73,15 +75,16 @@ class TimeSeriesMambaRegressor(nn.Module):
         -------
         (B,) — giá trị dự đoán cho từng sample trong batch
         """
-        x         = self.feature_proj(x_seq)                  # (B, T, d_model)
-        loc_token = self.location_emb(loc_ids).unsqueeze(1)   # (B, 1, d_model)
-        x         = torch.cat([loc_token, x], dim=1)          # (B, T+1, d_model)
+        loc_vec = self.location_emb(loc_ids)  # (B, E)
+        loc_seq = loc_vec.unsqueeze(1).expand(-1, x_seq.size(1), -1)  # (B, T, E)
+        x = torch.cat([x_seq, loc_seq], dim=-1)  # (B, T, F+E)
+        x = self.input_proj(x)  # (B, T, d_model)
 
         for layer in self.layers:
             x = layer(x)
 
         x = self.norm(x)
-        return self.head(x[:, -1, :]).squeeze(-1)              # lấy last token
+        return self.head(x[:, -1, :]).squeeze(-1)              # lấy last timestep
 
 
 # ---------------------------------------------------------------------------

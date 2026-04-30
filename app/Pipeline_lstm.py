@@ -70,6 +70,12 @@ class LSTMForecaster(nn.Module):
         else:
             lstm_input_size = input_size
 
+        # Fuse all inputs into a single stream before the LSTM
+        self.input_proj = nn.Sequential(
+            nn.Linear(lstm_input_size, lstm_input_size),
+            nn.GELU(),
+        )
+
         self.lstm = nn.LSTM(
             lstm_input_size,
             hidden_size,
@@ -91,6 +97,7 @@ class LSTMForecaster(nn.Module):
             loc_vec = self.location_emb(loc_ids)  # (B, E)
             loc_vec = loc_vec.unsqueeze(1).expand(-1, x.size(1), -1)  # (B, T, E)
             x = torch.cat([x, loc_vec], dim=-1)
+        x = self.input_proj(x)
         out, _ = self.lstm(x)
         return self.fc(out[:, -1, :])
 
