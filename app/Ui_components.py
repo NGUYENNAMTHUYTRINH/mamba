@@ -275,7 +275,7 @@ def render_train_config() -> dict:
 
     with conf2:
         epochs = st.number_input("Epochs", min_value=1, max_value=200, value=5, step=1)
-        batch_size = st.number_input("Batch size", min_value=8, max_value=8192, value=128, step=8)
+        batch_size = st.number_input("Batch size", min_value=8, max_value=8192, value=512, step=8)
         lr = st.number_input("Learning rate", min_value=1e-6, max_value=1e-1, value=3e-4, format="%.6f")
         weight_decay = st.number_input("Weight decay", min_value=0.0, max_value=1.0, value=1e-4, format="%.6f")
 
@@ -365,7 +365,7 @@ def render_comparison_config() -> dict:
                 tft_hidden = st.number_input("Hidden size", min_value=16, max_value=512, value=64, step=16, key="tft_hidden")
 
     # ── Hyperparams LSTM (chỉ hiện khi được chọn) ──────────────────────────
-    lstm_lookback, lstm_hidden, lstm_num_layers, lstm_dropout = 24, 64, 2, 0.2
+    lstm_lookback, lstm_hidden, lstm_num_layers, lstm_dropout = 24, 256, 4, 0.3
     if run_lstm:
         with st.expander("⚙️ Cấu hình LSTM", expanded=False):
             lc1, lc2, lc3, lc4 = st.columns(4)
@@ -504,15 +504,44 @@ def render_tft_results(tft_summary: dict, tft_hist_df: pd.DataFrame | None, tft_
         st.dataframe(tft_pred_df.head(100), use_container_width=True)
 
 
-def render_lstm_results(lstm_hist_df: pd.DataFrame | None, lstm_pred_df: pd.DataFrame | None) -> None:
-    """Hiển thị kết quả LSTM riêng."""
+def render_lstm_results(
+    lstm_hist_df: pd.DataFrame | None,
+    lstm_pred_df: pd.DataFrame | None,
+    lstm_summary: dict | None = None,
+) -> None:
+    """Hiển thị kết quả LSTM — cấu trúc giống render_mamba_results."""
+    if lstm_summary is not None:
+        st.success("Train/Test LSTM hoàn tất")
+        met1, met2, met3, met4 = st.columns(4)
+        met1.metric("Val MAE",  f"{lstm_summary.get('val_mae',  float('nan')):.4f}")
+        met2.metric("Val RMSE", f"{lstm_summary.get('val_rmse', float('nan')):.4f}")
+        met3.metric("Val R²",   f"{lstm_summary.get('val_r2',   float('nan')):.4f}")
+        met4.metric("Locations", f"{int(lstm_summary.get('future_locations', 0)):,}")
+
+        st.write("### Thống kê thời gian LSTM")
+        st.write(
+            {k: round(float(v), 2) if isinstance(v, float) else v
+             for k, v in {
+                 "train_only_sec": lstm_summary.get("train_only_sec", float("nan")),
+                 "eval_sec":       lstm_summary.get("eval_sec",       float("nan")),
+                 "forecast_sec":   lstm_summary.get("forecast_sec",   float("nan")),
+                 "io_sec":         lstm_summary.get("io_sec",         float("nan")),
+                 "run_sec":        lstm_summary.get("run_sec",        float("nan")),
+                 "device":         lstm_summary.get("device",         "?"),
+                 "split_train":    lstm_summary.get("split_train",    "?"),
+                 "split_val":      lstm_summary.get("split_val",      "?"),
+                 "split_test":     lstm_summary.get("split_test",     "?"),
+             }.items()}
+        )
+
     if lstm_hist_df is not None:
         st.write("### Lịch sử train LSTM")
         st.dataframe(lstm_hist_df, use_container_width=True)
 
     if lstm_pred_df is not None and not lstm_pred_df.empty:
-        st.write("### LSTM predictions preview")
-        st.dataframe(lstm_pred_df.head(100), use_container_width=True)
+        st.write("### Dự báo 24 giờ tiếp theo (LSTM)")
+        st.dataframe(lstm_pred_df.head(300), use_container_width=True)
+
 
 
 def render_comparison_table(

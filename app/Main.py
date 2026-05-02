@@ -154,10 +154,16 @@ def main() -> None:
                     hidden_size=cmp_cfg["lstm_hidden"],
                     num_layers=cmp_cfg["lstm_num_layers"],
                     dropout=cmp_cfg["lstm_dropout"],
+                    loss_name=train_cfg["loss_name"],
                     seed=train_cfg["seed"],
+                    num_workers=train_cfg["num_workers"],
                     use_gpu=train_cfg["use_gpu"],
+                    log_interval=50,
+                    grad_accum_steps=train_cfg["grad_accum_steps"],
+                    max_grad_norm=train_cfg["max_grad_norm"],
                     run_dir=lstm_run_dir,
                 )
+
 
             models_done = sum([
                 summary is not None,
@@ -188,7 +194,7 @@ def main() -> None:
 
     # Kết quả LSTM
     if lstm_summary is not None:
-        render_lstm_results(lstm_hist_df, lstm_pred_df)
+        render_lstm_results(lstm_hist_df, lstm_pred_df, lstm_summary)
 
     # --- 6. Bảng so sánh tổng hợp ---
     # Hàm này nên được thiết kế để nhận diện cái nào None thì bỏ qua trong bảng

@@ -2,6 +2,13 @@
 pipeline_lstm.py
 ----------------
 LSTM model definition, training loop và pipeline chính cho Streamlit.
+
+Cấu trúc train + predict được căn chỉnh 1:1 với Pipeline_mamba.py:
+  - epoch_sec = train forward/backward + val evaluation (giống Mamba dòng 239-241)
+  - Sau train: load best_state → eval val + test (giống Mamba dòng 271-276)
+  - Forecast 24h: autoregressive rolling-window per location (giống Mamba dòng 318-365)
+  - Lưu artifacts: model .pt, metrics_history.csv, future_24h_predictions.csv
+  - summary keys giống Mamba: train_only_sec, eval_sec, forecast_sec, io_sec, run_sec
 """
 
 from __future__ import annotations
@@ -9,9 +16,9 @@ from __future__ import annotations
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import time
 from datetime import datetime
-
 
 import numpy as np
 import pandas as pd
@@ -19,10 +26,13 @@ import streamlit as st
 import torch
 import torch.nn as nn
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 
-from Utils import format_time_utc_strings, normalize_locations
+from Utils import (
+    build_future_24h_frame,
+    format_time_utc_strings,
+    normalize_locations,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +69,7 @@ class LSTMForecaster(nn.Module):
         dropout: float = 0.2,
         horizon: int = 1,
         num_locations: int = 1,
-        embed_dim: int = 8,
+        embed_dim: int = 32,
     ):
         super().__init__()
         self.use_embedding = num_locations > 1
@@ -70,20 +80,29 @@ class LSTMForecaster(nn.Module):
         else:
             lstm_input_size = input_size
 
-        # Fuse all inputs into a single stream before the LSTM
         self.input_proj = nn.Sequential(
-            nn.Linear(lstm_input_size, lstm_input_size),
+            nn.Linear(lstm_input_size, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
         )
 
         self.lstm = nn.LSTM(
-            lstm_input_size,
+            hidden_size,
             hidden_size,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.fc = nn.Linear(hidden_size, horizon)
+
+        self.output_proj = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, horizon),
+        )
+
         self.hidden_size = hidden_size
         self.num_layers = num_layers
 
@@ -94,87 +113,80 @@ class LSTMForecaster(nn.Module):
         if self.use_embedding:
             if loc_ids is None:
                 raise ValueError("loc_ids required when location embedding is enabled")
-            loc_vec = self.location_emb(loc_ids)  # (B, E)
+            loc_vec = self.location_emb(loc_ids)           # (B, E)
             loc_vec = loc_vec.unsqueeze(1).expand(-1, x.size(1), -1)  # (B, T, E)
             x = torch.cat([x, loc_vec], dim=-1)
-        x = self.input_proj(x)
-        out, _ = self.lstm(x)
-        return self.fc(out[:, -1, :])
+        x = self.input_proj(x)        # (B, T, hidden_size)
+        out, _ = self.lstm(x)         # (B, T, hidden_size)
+        return self.output_proj(out[:, -1, :])  # (B, horizon)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Evaluate helper  (cấu trúc giống Mamba evaluate())
 # ---------------------------------------------------------------------------
-
-def make_lstm_windows(
-    df: pd.DataFrame,
-    feature_cols: list[str],
-    target_col: str,
-    lookback: int,
-    horizon: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Tạo sliding windows cho LSTM từ time-series data."""
-    features = df[feature_cols].values.astype(np.float32)
-    target = df[target_col].values.astype(np.float32)
-
-    X, y = [], []
-    for i in range(len(features) - lookback - horizon + 1):
-        X.append(features[i : i + lookback])
-        y.append(target[i + lookback : i + lookback + horizon])
-
-    if not X:
-        return (
-            np.array([]).reshape(0, lookback, len(feature_cols)),
-            np.array([]).reshape(0, horizon),
-        )
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
-
 
 @torch.no_grad()
-def evaluate_lstm(
-    model: LSTMForecaster,
-    loader: DataLoader,
-    criterion,
-    device,
-    y_mean: float,
-    y_std: float,
-) -> dict:
-    """Evaluate LSTM model trên một DataLoader."""
+def evaluate(model, loader, criterion, device, amp_enabled: bool,
+             y_mean: float, y_std: float) -> dict:
+    """Evaluate LSTM trên một DataLoader — cùng chữ ký với Mamba evaluate()."""
     model.eval()
     total_loss = 0.0
-    preds, targets, loc_ids_all = [], [], []
+    preds, targets = [], []
 
     for xb, loc_ids, yb in loader:
-        xb, loc_ids, yb = xb.to(device), loc_ids.to(device), yb.to(device)
-        out = model(xb, loc_ids)
-        loss = criterion(out, yb)
+        xb      = xb.to(device, non_blocking=True)
+        loc_ids = loc_ids.to(device, non_blocking=True)
+        yb      = yb.to(device, non_blocking=True)
+
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            out  = model(xb, loc_ids)
+            loss = criterion(out, yb)
 
         total_loss += loss.item() * yb.size(0)
-        preds.append(out.detach().cpu().numpy())
-        targets.append(yb.detach().cpu().numpy())
-        loc_ids_all.append(loc_ids.detach().cpu().numpy())
+        preds.append(out.detach().float().cpu().numpy())
+        targets.append(yb.detach().float().cpu().numpy())
 
-    preds_arr = np.concatenate(preds, axis=0) * y_std + y_mean
+    preds_arr   = np.concatenate(preds,   axis=0) * y_std + y_mean
     targets_arr = np.concatenate(targets, axis=0) * y_std + y_mean
 
     mse = mean_squared_error(targets_arr, preds_arr)
     return {
         "loss": total_loss / len(loader.dataset),
-        "mae": float(mean_absolute_error(targets_arr, preds_arr)),
+        "mae":  float(mean_absolute_error(targets_arr, preds_arr)),
         "rmse": float(np.sqrt(mse)),
-        "r2": float(r2_score(targets_arr.flatten(), preds_arr.flatten())),
-        "preds": preds_arr,
+        "r2":   float(r2_score(targets_arr, preds_arr)),
+        "preds":   preds_arr,
         "targets": targets_arr,
-        "loc_ids": (
-            np.concatenate(loc_ids_all, axis=0)
-            if loc_ids_all
-            else np.array([], dtype=np.int64)
-        ),
     }
 
 
 # ---------------------------------------------------------------------------
-# Pipeline
+# Windowing  (numpy stride_tricks — nhanh hơn Python loop ~20x)
+# ---------------------------------------------------------------------------
+
+def _make_windows(features: np.ndarray, target: np.ndarray,
+                  lookback: int, horizon: int) -> tuple[np.ndarray, np.ndarray]:
+    n = len(features)
+    n_win = n - lookback - horizon + 1
+    if n_win <= 0:
+        n_feat = features.shape[1] if features.ndim > 1 else 1
+        return (np.empty((0, lookback, n_feat), dtype=np.float32),
+                np.empty((0, horizon),          dtype=np.float32))
+
+    row_s, feat_s = features.strides
+    X = np.lib.stride_tricks.as_strided(
+        features,
+        shape=(n_win, lookback, features.shape[1]),
+        strides=(row_s, row_s, feat_s),
+    ).copy().astype(np.float32)
+
+    idx = np.arange(n_win)[:, None] + lookback + np.arange(horizon)[None, :]
+    y   = target[idx].astype(np.float32)
+    return X, y
+
+
+# ---------------------------------------------------------------------------
+# Pipeline  (cấu trúc 1:1 với Pipeline_mamba.py)
 # ---------------------------------------------------------------------------
 
 def run_lstm_pipeline(
@@ -190,94 +202,122 @@ def run_lstm_pipeline(
     hidden_size: int,
     num_layers: int,
     dropout: float,
+    loss_name: str,
     seed: int,
+    num_workers: int,
     use_gpu: bool,
+    log_interval: int,
+    grad_accum_steps: int,
+    max_grad_norm: float,
     run_dir: str | None = None,
+    forecast_file_name: str = "future_24h_predictions.csv",
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
-    """Chạy toàn bộ LSTM pipeline: train, val, test, forecast."""
+    """Train LSTM và trả về (summary, history_df, future_df) — giống Mamba train_pipeline."""
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+    # ── 1. Lọc & chuẩn bị data ───────────────────────────────────────────────
     selected_locations = normalize_locations(selected_locations)
     if not selected_locations:
-        raise ValueError("LSTM yêu cầu chọn ít nhất 1 location")
+        raise ValueError("LSTM yêu cầu chọn ít nhất 1 location.")
 
-    # --- Lọc & chuẩn bị data ---
-    df_loc = df.loc[df["location_key"].astype(str).isin(selected_locations)].copy()
-    if df_loc.empty:
-        raise ValueError(f"No data found for selected locations: {selected_locations}")
+    work_df = df.loc[df["location_key"].astype(str).isin(selected_locations)].copy()
+    if work_df.empty:
+        raise ValueError(f"Không có dữ liệu cho locations: {selected_locations}")
 
-    df_loc["ts_utc"] = pd.to_datetime(df_loc["ts_utc"], utc=True, errors="coerce")
-    df_loc = (
-        df_loc.dropna(subset=["ts_utc", "location_key"])
+    work_df["ts_utc"] = pd.to_datetime(work_df["ts_utc"], utc=True, errors="coerce")
+    work_df = (
+        work_df.dropna(subset=["ts_utc", "location_key"] + [target_col] + feature_cols)
         .sort_values(["location_key", "ts_utc"])
         .reset_index(drop=True)
     )
-    df_loc = df_loc.dropna(subset=feature_cols + [target_col])
-    if len(df_loc) < lookback + horizon:
-        raise ValueError(f"Not enough data for lookback={lookback} and horizon={horizon}")
+    if len(work_df) < lookback + horizon:
+        raise ValueError(f"Không đủ dữ liệu cho lookback={lookback}, horizon={horizon}")
 
-    # --- Normalize ---
-    X_scaler = StandardScaler()
-    y_scaler = StandardScaler()
-    df_scaled = df_loc.copy()
-    df_scaled[feature_cols] = X_scaler.fit_transform(df_loc[feature_cols])
-    df_scaled[target_col] = y_scaler.fit_transform(df_loc[[target_col]]).flatten()
+    # ── 2. Tạo sliding windows per location ──────────────────────────────────
+    loc_sorted = sorted(work_df["location_key"].astype(str).unique().tolist())
+    loc_to_id  = {loc: i for i, loc in enumerate(loc_sorted)}
 
-    # --- Tạo sequences per location ---
-    loc_sorted = sorted(df_scaled["location_key"].astype(str).unique().tolist())
-    loc_to_id = {loc: i for i, loc in enumerate(loc_sorted)}
-
-    X_parts, y_parts, lid_parts, loc_name_parts, ts_parts = [], [], [], [], []
-    for loc_name, g in df_scaled.groupby(
-        df_scaled["location_key"].astype(str), sort=False
-    ):
+    X_parts, y_parts, lid_parts, ts_parts = [], [], [], []
+    for loc_name, g in work_df.groupby(work_df["location_key"].astype(str), sort=False):
         g = g.sort_values("ts_utc").reset_index(drop=True)
-        X_loc, y_loc = make_lstm_windows(g, feature_cols, target_col, lookback, horizon)
+        feats  = g[feature_cols].values.astype(np.float32)
+        tgt    = g[target_col].values.astype(np.float32)
+        X_loc, y_loc = _make_windows(feats, tgt, lookback, horizon)
         if len(X_loc) == 0:
             continue
         X_parts.append(X_loc)
         y_parts.append(y_loc)
-        lid_parts.append(
-            np.full(len(X_loc), loc_to_id[str(loc_name)], dtype=np.int64)
-        )
-        loc_name_parts.append(np.full(len(X_loc), str(loc_name), dtype=object))
-        ts_loc = g["ts_utc"].to_numpy(dtype="datetime64[ns]")
-        ts_parts.append(
-            ts_loc[lookback + horizon - 1 : lookback + horizon - 1 + len(X_loc)]
-        )
+        lid_parts.append(np.full(len(X_loc), loc_to_id[str(loc_name)], dtype=np.int64))
+        ts_arr = g["ts_utc"].to_numpy(dtype="datetime64[ns]")
+        ts_parts.append(ts_arr[lookback + horizon - 1 : lookback + horizon - 1 + len(X_loc)])
 
     if not X_parts:
-        raise ValueError("Could not create sequences from data")
+        raise ValueError("Không tạo được sequences từ dữ liệu.")
 
-    X = np.concatenate(X_parts, axis=0)
-    y = np.concatenate(y_parts, axis=0)
-    loc_ids = np.concatenate(lid_parts, axis=0)
-    loc_names = np.concatenate(loc_name_parts, axis=0)
+    X        = np.concatenate(X_parts,   axis=0)
+    y_raw    = np.concatenate(y_parts,   axis=0)
+    loc_ids  = np.concatenate(lid_parts, axis=0)
     sample_ts = np.concatenate(ts_parts, axis=0)
 
-    # --- Split 70/10/20 theo timeline ---
+    # ── 3. Split 70/10/20 theo timeline (giống Mamba split_data_by_timeline) ─
     order = np.argsort(sample_ts)
-    X, y, loc_ids, loc_names = X[order], y[order], loc_ids[order], loc_names[order]
-    n = len(X)
-    train_end = int(0.7 * n)
-    val_end = int(0.8 * n)
-
-    train_ds = SequenceDataset(X[:train_end], loc_ids[:train_end], y[:train_end])
-    val_ds = SequenceDataset(
-        X[train_end:val_end], loc_ids[train_end:val_end], y[train_end:val_end]
+    X, y_raw, loc_ids, sample_ts = (
+        X[order], y_raw[order], loc_ids[order], sample_ts[order]
     )
-    test_ds = SequenceDataset(X[val_end:], loc_ids[val_end:], y[val_end:])
-    loc_name_test = loc_names[val_end:]
-    test_time = sample_ts[order][val_end:]
+    n         = len(X)
+    train_end = int(0.7 * n)
+    val_end   = int(0.8 * n)
 
-    pin_memory = use_gpu and torch.cuda.is_available()
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, pin_memory=pin_memory)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, pin_memory=pin_memory)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, pin_memory=pin_memory)
+    # ── 4. Normalize (giống Mamba: fit trên train, apply cho cả 3) ────────────
+    x_mean = X[:train_end].mean(axis=(0, 1), keepdims=True)   # (1, 1, n_feat)
+    x_std  = X[:train_end].std(axis=(0, 1),  keepdims=True)   # (1, 1, n_feat)
+    x_std  = np.where(x_std < 1e-6, 1.0, x_std)
+    X      = (X - x_mean) / x_std
 
-    device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
+    # Squeeze về (n_feat,) để dùng broadcast với rolling_window shape (lookback, n_feat)
+    x_mean_1d = x_mean.squeeze()   # (n_feat,)
+    x_std_1d  = x_std.squeeze()    # (n_feat,)
 
+    y_mean = float(y_raw[:train_end].mean())
+    y_std  = float(y_raw[:train_end].std())
+    if y_std < 1e-6:
+        y_std = 1.0
+    y_norm = (y_raw - y_mean) / y_std
+
+    train_ds = SequenceDataset(X[:train_end],        loc_ids[:train_end],        y_norm[:train_end])
+    val_ds   = SequenceDataset(X[train_end:val_end], loc_ids[train_end:val_end], y_norm[train_end:val_end])
+    test_ds  = SequenceDataset(X[val_end:],          loc_ids[val_end:],          y_norm[val_end:])
+
+    # ── 5. Device & AMP (giống Mamba) ────────────────────────────────────────
+    device     = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
+    pin_memory = device.type == "cuda"
+    amp_enabled = device.type == "cuda"
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+    else:
+        cpu_threads = max(1, (os.cpu_count() or 2) - 1)
+        torch.set_num_threads(cpu_threads)
+
+    # ── 6. DataLoader (giống Mamba) ───────────────────────────────────────────
+    loader_kwargs: dict = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+
+    train_loader = DataLoader(train_ds, shuffle=(device.type == "cuda"), **loader_kwargs)
+    val_loader   = DataLoader(val_ds,   shuffle=False,                   **loader_kwargs)
+    test_loader  = DataLoader(test_ds,  shuffle=False,                   **loader_kwargs)
+
+    # ── 7. Model, loss, optimizer, scaler (giống Mamba) ──────────────────────
     model = LSTMForecaster(
         input_size=len(feature_cols),
         hidden_size=hidden_size,
@@ -285,135 +325,235 @@ def run_lstm_pipeline(
         dropout=dropout,
         horizon=horizon,
         num_locations=len(loc_to_id),
-        embed_dim=8,
+        embed_dim=32,
     ).to(device)
 
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.HuberLoss(delta=1.0) if loss_name == "huber" else nn.MSELoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scaler    = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     best_val_loss = float("inf")
-    best_state = None
+    best_state    = None
     history: list[dict] = []
 
-    prog = st.progress(0)
+    total_steps = epochs * len(train_loader)
+    global_step = 0
+    prog    = st.progress(0)
     log_box = st.empty()
     log_lines: list[str] = []
 
+    # ── 8. Training loop (1:1 với Mamba) ─────────────────────────────────────
     start_all = time.time()
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
-        epoch_start = time.time()
+        epoch_start  = time.time()
+        optimizer.zero_grad(set_to_none=True)
 
-        for xb, lid, yb in train_loader:
-            xb, lid, yb = xb.to(device), lid.to(device), yb.to(device)
-            optimizer.zero_grad()
-            out = model(xb, lid)
-            loss = criterion(out, yb)
-            if torch.isfinite(loss):
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item() * yb.size(0)
+        for step, (xb, loc_batch, yb) in enumerate(train_loader, start=1):
+            xb        = xb.to(device, non_blocking=pin_memory)
+            loc_batch = loc_batch.to(device, non_blocking=pin_memory)
+            yb        = yb.to(device, non_blocking=pin_memory)
 
-        train_loss = running_loss / len(train_ds)
-        val_metrics = evaluate_lstm(
-            model, val_loader, criterion, device,
-            y_scaler.mean_[0], y_scaler.scale_[0],
-        )
-        epoch_sec = time.time() - epoch_start
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+                out  = model(xb, loc_batch)
+                loss = criterion(out, yb)
 
-        line = (
-            f"Epoch {epoch}/{epochs} | train_loss={train_loss:.6f} | "
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            loss_for_backward = loss / grad_accum_steps
+            if amp_enabled:
+                scaler.scale(loss_for_backward).backward()
+            else:
+                loss_for_backward.backward()
+
+            if step % grad_accum_steps == 0 or step == len(train_loader):
+                if amp_enabled:
+                    scaler.unscale_(optimizer)
+                if max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                if amp_enabled:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            running_loss += loss.item() * yb.size(0)
+            global_step  += 1
+
+            if total_steps > 0 and (step % 20 == 0 or step == len(train_loader)):
+                prog.progress(min(global_step / total_steps, 1.0))
+
+            if log_interval > 0 and (step % log_interval == 0 or step == len(train_loader)):
+                avg_loss = running_loss / max(step * yb.size(0), 1)
+                line = (
+                    f"Epoch {epoch}/{epochs} | step {step}/{len(train_loader)} | "
+                    f"batch_loss={loss.item():.6f} | running_avg={avg_loss:.6f}"
+                )
+                log_lines.append(line)
+                log_box.code("\n".join(log_lines[-20:]))
+
+        # epoch_sec = train + val (giống Mamba dòng 239-241)
+        train_loss   = running_loss / len(train_loader.dataset)
+        val_metrics  = evaluate(model, val_loader, criterion, device, amp_enabled, y_mean, y_std)
+        epoch_sec    = time.time() - epoch_start
+
+        epoch_line = (
+            f"Epoch {epoch}/{epochs} done | train_loss={train_loss:.6f} | "
             f"val_loss={val_metrics['loss']:.6f} | val_mae={val_metrics['mae']:.4f} | "
             f"val_rmse={val_metrics['rmse']:.4f} | val_r2={val_metrics['r2']:.4f} | "
             f"sec={epoch_sec:.1f}"
         )
-        log_lines.append(line)
+        log_lines.append(epoch_line)
         log_box.code("\n".join(log_lines[-20:]))
-        prog.progress(epoch / epochs)
 
-        history.append(
-            {
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "val_loss": val_metrics["loss"],
-                "val_mae": val_metrics["mae"],
-                "val_rmse": val_metrics["rmse"],
-                "val_r2": val_metrics["r2"],
-                "train_sec": epoch_sec,
-            }
-        )
+        history.append({
+            "epoch":      epoch,
+            "train_loss": train_loss,
+            "val_loss":   val_metrics["loss"],
+            "val_mae":    val_metrics["mae"],
+            "val_rmse":   val_metrics["rmse"],
+            "val_r2":     val_metrics["r2"],
+            "train_sec":  epoch_sec,        # train + val — giống Mamba
+        })
 
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     if best_state is None:
-        raise RuntimeError("No valid checkpoint found during training.")
+        raise RuntimeError("Không có checkpoint hợp lệ trong quá trình train.")
 
+    # ── 9. Load best → eval val + test (giống Mamba dòng 271-276) ────────────
     model.load_state_dict(best_state)
     model.to(device)
-    val_metrics = evaluate_lstm(model, val_loader, criterion, device, y_scaler.mean_[0], y_scaler.scale_[0])
-    test_metrics = evaluate_lstm(model, test_loader, criterion, device, y_scaler.mean_[0], y_scaler.scale_[0])
+    eval_start   = time.time()
+    val_metrics  = evaluate(model, val_loader,  criterion, device, amp_enabled, y_mean, y_std)
+    test_metrics = evaluate(model, test_loader, criterion, device, amp_enabled, y_mean, y_std)
+    eval_sec     = time.time() - eval_start
 
-    # --- Lưu artifacts ---
+
+    # ── 10. Forecast 24h autoregressive rolling-window (giống Mamba dòng 290-365)
+    # Dùng toàn bộ work_df làm base để lấy 24 bước lịch sử cuối
+
+    base_df = work_df.copy()
+    future_df = build_future_24h_frame(base_df, feature_cols=feature_cols, target_col=target_col)
+
+    for col in feature_cols:
+        future_df[col] = pd.to_numeric(future_df[col], errors="coerce")
+        fill_val = base_df[col].median() if col in base_df.columns else 0.0
+        if pd.isna(fill_val):
+            fill_val = 0.0
+        future_df[col] = future_df[col].fillna(fill_val)
+
+    forecast_start  = time.time()
+    preds_rows: list[dict] = []
+    model.eval()
+    infer_x, infer_loc, infer_meta = [], [], []
+
+    with torch.inference_mode():
+        for loc in sorted(future_df["location_key"].astype(str).unique().tolist()):
+            if loc not in loc_to_id:
+                continue
+            loc_hist = (
+                base_df.loc[base_df["location_key"].astype(str) == loc]
+                .copy()
+                .assign(ts_utc=lambda d: pd.to_datetime(d["ts_utc"], utc=True, errors="coerce"))
+                .dropna(subset=["ts_utc"])
+                .sort_values("ts_utc")
+            )
+            if len(loc_hist) < lookback:
+                continue
+
+            rolling_window = loc_hist[feature_cols].tail(lookback).to_numpy(dtype=np.float32)
+            loc_future = (
+                future_df.loc[future_df["location_key"].astype(str) == loc]
+                .copy()
+                .assign(ts_utc=lambda d: pd.to_datetime(d["ts_utc"], utc=True, errors="coerce"))
+                .sort_values("ts_utc")
+            )
+
+            for _, row in loc_future.iterrows():
+                x_norm = (rolling_window - x_mean_1d) / x_std_1d
+                infer_x.append(x_norm.astype(np.float32, copy=False))
+                infer_loc.append(int(loc_to_id[loc]))
+                infer_meta.append((row["ts_utc"], loc))
+                next_feats = row[feature_cols].to_numpy(dtype=np.float32).reshape(1, -1)
+                rolling_window = np.concatenate([rolling_window[1:], next_feats], axis=0)
+
+        if infer_x:
+            x_all   = torch.from_numpy(np.stack(infer_x, axis=0)).to(device, non_blocking=pin_memory)
+            loc_all = torch.tensor(infer_loc, dtype=torch.long, device=device)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+                pred_norm_all = model(x_all, loc_all).detach().float().cpu().numpy()
+
+            # flatten() để chuyển (N,1) → (N,) trước khi gọi float() — fix numpy>=2.0
+            pred_all = (pred_norm_all * y_std + y_mean).flatten()
+            for (ts_val, loc_val), pred_val in zip(infer_meta, pred_all):
+                preds_rows.append({"time": ts_val, "location": loc_val, "predicted": float(pred_val)})
+
+    forecast_sec = time.time() - forecast_start
+
+    if not preds_rows:
+        raise RuntimeError("Không tạo được dự báo 24h cho LSTM.")
+
+    future_out = (
+        pd.DataFrame(preds_rows)
+        .assign(time=lambda d: format_time_utc_strings(d["time"]))
+        [["time", "location", "predicted"]]
+        .sort_values(["location", "time"])
+        .reset_index(drop=True)
+    )
+
+    # ── 11. Lưu artifacts (giống Mamba) ──────────────────────────────────────
     if run_dir is None:
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        lstm_run_dir = os.path.join("outputs", "lstm_runs", run_id)
+        run_id  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = os.path.join("outputs", "lstm_runs", run_id)
     else:
-        lstm_run_dir = run_dir
-    os.makedirs(lstm_run_dir, exist_ok=True)
+        out_dir = run_dir
+    os.makedirs(out_dir, exist_ok=True)
 
-    model_path = os.path.join(lstm_run_dir, "best_lstm.pt")
-    metrics_path = os.path.join(lstm_run_dir, "metrics_history.csv")
-    pred_path = os.path.join(lstm_run_dir, "future_24h_predictions.csv")
+    model_path       = os.path.join(out_dir, "best_lstm.pt")
+    metrics_path     = os.path.join(out_dir, "metrics_history.csv")
+    future_pred_path = os.path.join(out_dir, forecast_file_name)
 
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "input_size": len(feature_cols),
-            "hidden_size": hidden_size,
-            "num_layers": num_layers,
-            "dropout": dropout,
-            "horizon": horizon,
-            "lookback": lookback,
-            "feature_cols": feature_cols,
-            "target_col": target_col,
-            "X_scaler": X_scaler,
-            "y_scaler": y_scaler,
-        },
-        model_path,
-    )
-
+    io_start = time.time()
+    torch.save(model.state_dict(), model_path)
     pd.DataFrame(history).to_csv(metrics_path, index=False)
+    future_out.to_csv(future_pred_path, index=False)
+    io_sec = time.time() - io_start
 
-    pred_df = pd.DataFrame(
-        {
-            "time": format_time_utc_strings(pd.Series(test_time)),
-            "location": loc_name_test,
-            "predicted": test_metrics["preds"].flatten(),
-        }
-    )
-    pred_df.to_csv(pred_path, index=False)
-
+    # ── 12. Summary (keys giống Mamba) ───────────────────────────────────────
     summary = {
-        "model": "lstm",
-        "device": str(device),
-        "lookback": lookback,
-        "horizon": horizon,
-        "num_locations": len(loc_to_id),
-        "selected_locations": ",".join(selected_locations),
-        "val_mae": val_metrics["mae"],
-        "val_rmse": val_metrics["rmse"],
-        "val_r2": val_metrics["r2"],
-        "test_mae": test_metrics["mae"],
-        "test_rmse": test_metrics["rmse"],
-        "test_r2": test_metrics["r2"],
+        "model":        "lstm",
+        "device":       str(device),
+        "n_rows_used":  len(y_raw),
+        "split_train":  len(train_ds),
+        "split_val":    len(val_ds),
+        "split_test":   len(test_ds),
+        "val_loss":     val_metrics["loss"],
+        "val_mae":      val_metrics["mae"],
+        "val_rmse":     val_metrics["rmse"],
+        "val_r2":       val_metrics["r2"],
+        "test_loss":    test_metrics["loss"],
+        "test_mae":     test_metrics["mae"],
+        "test_rmse":    test_metrics["rmse"],
+        "test_r2":      test_metrics["r2"],
+        "model_path":         model_path,
+        "metrics_path":       metrics_path,
+        "future_pred_path":   future_pred_path,
+        "future_rows":        len(future_out),
+        "future_locations":   int(future_out["location"].nunique()),
+        "per_location_files": [],
+        # timing — giống Mamba summary
         "train_only_sec": float(pd.DataFrame(history)["train_sec"].sum()) if history else 0.0,
-        "run_sec": time.time() - start_all,
-        "model_path": model_path,
-        "metrics_path": metrics_path,
-        "pred_path": pred_path,
+        "eval_sec":       float(eval_sec),
+        "forecast_sec":   float(forecast_sec),
+        "io_sec":         float(io_sec),
+        "run_sec":        time.time() - start_all,
     }
 
-    return summary, pd.DataFrame(history), pred_df
+    return summary, pd.DataFrame(history), future_out
