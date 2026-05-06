@@ -27,7 +27,16 @@ class TS(object):
         # type: (Conf) -> None
 
         self.cnf = cnf
-        self.data_formatter = utils.make_data_formatter(cnf.ds_name)
+        if cnf.ds_name == "air_quality":
+            from data_formatters.air_quality import AirQualityFormatter
+            feature_cols = self.cnf.all_params.get("feature_cols")
+            target_col = self.cnf.all_params.get("target_col", "aqi")
+            self.data_formatter = AirQualityFormatter(
+                feature_cols=feature_cols,
+                target_col=target_col,
+            )
+        else:
+            self.data_formatter = utils.make_data_formatter(cnf.ds_name)
 
         loader = TSDataset
         dataset_test = loader(self.cnf, self.data_formatter)

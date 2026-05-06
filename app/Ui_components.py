@@ -232,8 +232,17 @@ def _render_sample_count_preview(
             st.warning("Không thể load helper 'build_time_series_samples' để preview samples.")
             return
 
+        feature_cols = [c for c in df_sel.columns if c not in ["ts_utc", "location_key"]]
+        if default_target not in feature_cols:
+            feature_cols.append(default_target)
+
         x_seq, loc_ids, y, y_ts, _, _ = mod.build_time_series_samples(
-            df_sel, default_target, window, horizon
+            df_sel,
+            default_target,
+            window,
+            horizon,
+            feature_cols=feature_cols,
+            include_target_history=True,
         )
         if hasattr(mod, "split_data_by_timeline"):
             train, val, test = mod.split_data_by_timeline(x_seq, loc_ids, y, y_ts)
@@ -357,7 +366,15 @@ def render_comparison_config() -> dict:
         with st.expander("⚙️ Cấu hình Mamba", expanded=False):
             mc1, mc2, mc3 = st.columns(3)
             with mc1:
-                mamba_lookback = st.number_input("Lookback (timesteps)", min_value=1, max_value=168, value=24, step=1, key="mamba_lookback")
+                mamba_lookback = st.number_input(
+                    "Lookback (timesteps)",
+                    min_value=24,
+                    max_value=24,
+                    value=24,
+                    step=1,
+                    key="mamba_lookback",
+                    disabled=True,
+                )
             with mc2:
                 mamba_d_model = st.number_input("d_model", min_value=16, max_value=512, value=64, step=16, key="mamba_d_model")
             with mc3:
@@ -369,7 +386,15 @@ def render_comparison_config() -> dict:
         with st.expander("⚙️ Cấu hình TFT", expanded=False):
             tc1, tc2 = st.columns(2)
             with tc1:
-                tft_lookback = st.number_input("Lookback (timesteps)", min_value=1, max_value=168, value=24, step=1, key="tft_lookback")
+                tft_lookback = st.number_input(
+                    "Lookback (timesteps)",
+                    min_value=24,
+                    max_value=24,
+                    value=24,
+                    step=1,
+                    key="tft_lookback",
+                    disabled=True,
+                )
             with tc2:
                 tft_hidden = st.number_input("Hidden size", min_value=16, max_value=512, value=64, step=16, key="tft_hidden")
 
@@ -379,7 +404,15 @@ def render_comparison_config() -> dict:
         with st.expander("⚙️ Cấu hình LSTM", expanded=False):
             lc1, lc2, lc3, lc4 = st.columns(4)
             with lc1:
-                lstm_lookback = st.number_input("Lookback", min_value=1, max_value=168, value=24, step=1, key="lstm_lookback")
+                lstm_lookback = st.number_input(
+                    "Lookback",
+                    min_value=24,
+                    max_value=24,
+                    value=24,
+                    step=1,
+                    key="lstm_lookback",
+                    disabled=True,
+                )
             with lc2:
                 lstm_hidden = st.number_input("Hidden size", min_value=16, max_value=512, value=64, step=16, key="lstm_hidden")
             with lc3:

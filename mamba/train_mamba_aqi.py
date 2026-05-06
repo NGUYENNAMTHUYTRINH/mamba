@@ -49,6 +49,8 @@ def build_time_series_samples(
     target_col: str,
     window_size: int,
     horizon: int,
+    feature_cols: list[str] | None = None,
+    include_target_history: bool = True,
 ):
     """Tạo sliding-window samples từ DataFrame time-series nhiều location.
 
@@ -79,25 +81,36 @@ def build_time_series_samples(
 
     work = df.copy()
     work["_ts"] = pd.to_datetime(work["ts_utc"], utc=True, errors="coerce")
-    work = work.dropna(subset=["_ts", "location_key", target_col]).copy()
-    if work.empty:
-        raise ValueError("Không còn dòng hợp lệ sau khi loại bỏ NaN ts_utc/location_key/target.")
+    missing_required = work[["_ts", "location_key", target_col]].isna().any(axis=1)
+    if missing_required.any():
+        raise ValueError("Dữ liệu chứa NaN ở ts_utc/location_key/target. Vui lòng làm sạch trước.")
 
     work["_loc_id"] = work["location_key"].astype("category").cat.codes.astype(np.int64)
     num_locations   = int(work["_loc_id"].max()) + 1
 
-    # Chọn feature: numeric, loại target và _loc_id
-    numeric_cols = work.select_dtypes(include=[np.number]).columns.tolist()
-    for col in [target_col, "_loc_id"]:
-        if col in numeric_cols:
-            numeric_cols.remove(col)
-    if not numeric_cols:
-        raise ValueError("Không tìm thấy cột feature numeric nào sau khi loại target.")
+    # Chọn feature: ưu tiên feature_cols nếu được truyền vào
+    if feature_cols is None:
+        numeric_cols = work.select_dtypes(include=[np.number]).columns.tolist()
+        for col in [target_col, "_loc_id"]:
+            if col in numeric_cols:
+                numeric_cols.remove(col)
+        if include_target_history and target_col in work.columns:
+            numeric_cols.append(target_col)
+    else:
+        numeric_cols = [c for c in feature_cols if c in work.columns and c != "_loc_id"]
+        if include_target_history and target_col in work.columns and target_col not in numeric_cols:
+            numeric_cols.append(target_col)
+        if not include_target_history and target_col in numeric_cols:
+            numeric_cols.remove(target_col)
 
-    # Fill NaN bằng median
+    if not numeric_cols:
+        raise ValueError("Không tìm thấy cột feature numeric nào sau khi lọc.")
+
+    # Ép numeric và kiểm tra NaN
     for col in numeric_cols:
-        median_val = work[col].median()
-        work[col]  = work[col].fillna(median_val if not pd.isna(median_val) else 0.0)
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    if work[numeric_cols].isna().any(axis=1).any():
+        raise ValueError("Dữ liệu chứa NaN ở feature_cols. Vui lòng làm sạch trước.")
 
     work = work.sort_values(["_loc_id", "_ts"]).reset_index(drop=True)
 

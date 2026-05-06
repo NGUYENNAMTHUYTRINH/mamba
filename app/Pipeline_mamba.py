@@ -129,7 +129,12 @@ def train_pipeline(
     window_size = 24
     horizon = 1
     x_seq, loc_ids, y, y_ts, num_locations, ts_feature_cols = mod.build_time_series_samples(
-        df=work_df, target_col=target_col, window_size=window_size, horizon=horizon
+        df=work_df,
+        target_col=target_col,
+        window_size=window_size,
+        horizon=horizon,
+        feature_cols=feature_cols,
+        include_target_history=True,
     )
 
     train_split, val_split, test_split = mod.split_data_by_timeline(x_seq, loc_ids, y, y_ts)

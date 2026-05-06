@@ -42,7 +42,13 @@ class Trainer(object):
         if cnf.ds_name == "air_quality":
             # Nếu chạy air_quality, import class và truyền biến loc vào
             from data_formatters.air_quality import AirQualityFormatter
-            self.data_formatter = AirQualityFormatter(selected_locations=self.selected_locations)
+            feature_cols = self.cnf.all_params.get("feature_cols")
+            target_col = self.cnf.all_params.get("target_col", "aqi")
+            self.data_formatter = AirQualityFormatter(
+                selected_locations=self.selected_locations,
+                feature_cols=feature_cols,
+                target_col=target_col,
+            )
         else:
             self.data_formatter = utils.make_data_formatter(cnf.ds_name)
 

@@ -30,6 +30,8 @@ from Utils import format_time_utc_strings, normalize_locations, synthesize_tft_t
 
 def run_tft_pipeline(
     selected_locations: list[str],
+    target_col: str,
+    feature_cols: list[str],
     epochs: int,
     batch_size: int,
     lr: float,
@@ -66,6 +68,24 @@ def run_tft_pipeline(
     cfg["point_forecast"] = True
     cfg["use_quantile_loss_for_tft"] = False
     cfg["quantiles"] = [0.5]
+    cfg["target_col"] = str(target_col)
+    cfg["feature_cols"] = [str(c) for c in feature_cols]
+    cfg["total_time_steps"] = 25
+    cfg["num_encoder_steps"] = 24
+
+    feature_cols_no_target = [c for c in cfg["feature_cols"] if c != cfg["target_col"]]
+    input_size = 1 + len(feature_cols_no_target) + 1
+    cfg["input_size"] = int(input_size)
+    cfg["output_size"] = 1
+    cfg["input_obs_loc"] = [0]
+    cfg["static_input_loc"] = [int(input_size - 1)]
+    cfg["known_regular_inputs"] = list(range(1, max(1, int(input_size - 1))))
+    cfg["known_categorical_inputs"] = []
+    cfg["category_counts"] = [max(1, len(selected_locations))]
+    cfg["d_input"] = int(input_size)
+    cfg["d_output"] = 1
+    cfg["location_input_idx"] = int(input_size - 1)
+    cfg["location_vocab_size"] = max(1, len(selected_locations))
 
     # ── Xác định đường dẫn CSV đầu vào ──────────────────────────────────
     # ưu tiên: session_state["data_path"] (có thể từ path nhập tay hoặc file upload tạm)

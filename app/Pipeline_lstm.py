@@ -238,9 +238,17 @@ def run_lstm_pipeline(
         raise ValueError(f"Không có dữ liệu cho locations: {selected_locations}")
 
     work_df["ts_utc"] = pd.to_datetime(work_df["ts_utc"], utc=True, errors="coerce")
+    required_cols = ["ts_utc", "location_key", target_col] + feature_cols
+    if work_df[required_cols].isna().any(axis=1).any():
+        raise ValueError("Dữ liệu chứa NaN trong các cột required. Vui lòng làm sạch trước.")
+
+    for col in [target_col] + feature_cols:
+        work_df[col] = pd.to_numeric(work_df[col], errors="coerce")
+    if work_df[[target_col] + feature_cols].isna().any(axis=1).any():
+        raise ValueError("Dữ liệu chứa NaN trong feature/target sau khi ép numeric.")
+
     work_df = (
-        work_df.dropna(subset=["ts_utc", "location_key"] + [target_col] + feature_cols)
-        .sort_values(["location_key", "ts_utc"])
+        work_df.sort_values(["location_key", "ts_utc"])
         .reset_index(drop=True)
     )
     if len(work_df) < lookback + horizon:

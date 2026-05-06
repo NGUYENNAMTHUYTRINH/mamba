@@ -10,38 +10,13 @@ InputTypes = data_formatters.base.InputTypes
 
 class AirQualityFormatter(GenericDataFormatter):
 
-    _column_definition = [
-        ('location_key', DataTypes.CATEGORICAL, InputTypes.ID),
-        ('ts_utc', DataTypes.DATE, InputTypes.TIME),
-        ('aqi', DataTypes.REAL_VALUED, InputTypes.TARGET),
-        
-        # Numeric observed inputs (aligned with Mamba numeric selection)
-        ('pm25', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('pm10', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('no2', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('o3', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('so2', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('co', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('aod', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('dust', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('uv_index', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('co2', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        # Additional derived/auxiliary numeric features present in dataset
-        ('aqi_pm25', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('aqi_pm10', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('aqi_no2', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('aqi_o3', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('aqi_so2', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        ('aqi_co', DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT),
-        # Keep static categorical input at the end (matches TFT-style indexing)
-        ('location_key', DataTypes.CATEGORICAL, InputTypes.STATIC_INPUT),
-    ]
-
-    def __init__(self, selected_location=None, selected_locations=None):
+    def __init__(self, selected_location=None, selected_locations=None, feature_cols=None, target_col="aqi"):
         self.identifiers = None
         self._global_real_scaler = None
         self._global_target_scaler = None
         self._time_steps = 25 
+        self.target_col = str(target_col)
+        self.feature_cols = [str(c) for c in feature_cols] if feature_cols else None
         if selected_locations is None:
             if selected_location is None:
                 self.selected_locations = []
@@ -54,6 +29,29 @@ class AirQualityFormatter(GenericDataFormatter):
         self.selected_location = self.selected_locations[0] if len(self.selected_locations) == 1 else None
         self.feature_inputs = None
 
+        self._col_def = self._build_column_definition()
+
+    @property
+    def _column_definition(self):
+        return self._col_def
+
+    def _build_column_definition(self):
+        observed_inputs = []
+        if self.feature_cols:
+            observed_inputs = [c for c in self.feature_cols if c != self.target_col]
+
+        col_def = [
+            ('location_key', DataTypes.CATEGORICAL, InputTypes.ID),
+            ('ts_utc', DataTypes.DATE, InputTypes.TIME),
+            (self.target_col, DataTypes.REAL_VALUED, InputTypes.TARGET),
+        ]
+
+        for col in observed_inputs:
+            col_def.append((col, DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT))
+
+        col_def.append(('location_key', DataTypes.CATEGORICAL, InputTypes.STATIC_INPUT))
+        return col_def
+
     def split_data(self, df):
         # Mamba-like: create windows first, then split timeline on windows
         print("Formatting train-valid-test splits using window-first global timeline (70/10/20)...")
@@ -64,22 +62,24 @@ class AirQualityFormatter(GenericDataFormatter):
         time_column = utils.get_single_col_by_input_type(InputTypes.TIME, column_definitions)
         target_column = utils.get_single_col_by_input_type(InputTypes.TARGET, column_definitions)
 
-        # Ensure correct dtypes and drop rows with missing time/target
+        # Ensure correct dtypes and validate required columns
         df[time_column] = pd.to_datetime(df[time_column], utc=True, errors="coerce")
-        df = df.dropna(subset=[time_column, id_column, target_column]).copy()
         df[target_column] = pd.to_numeric(df[target_column], errors="coerce")
 
-        # Convert numeric columns and fill missing with median (like Mamba)
+        required_cols = [time_column, id_column, target_column]
+        if df[required_cols].isna().any(axis=1).any():
+            raise ValueError("Dữ liệu chứa NaN ở ts_utc/location_key/target. Vui lòng làm sạch trước.")
+
+        # Convert numeric columns and validate NaN (no fill/drop)
         real_inputs = utils.extract_cols_from_data_type(
             DataTypes.REAL_VALUED, column_definitions, set()
         )
         for col in real_inputs:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-                fill_val = df[col].median()
-                if pd.isna(fill_val):
-                    fill_val = 0.0
-                df[col] = df[col].fillna(fill_val)
+
+        if df[real_inputs].isna().any(axis=1).any():
+            raise ValueError("Dữ liệu chứa NaN ở feature_cols. Vui lòng làm sạch trước.")
 
         # Build window metadata per location: (end_ts, identifier, start, end)
         time_steps = int(self._time_steps)

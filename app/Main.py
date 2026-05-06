@@ -88,7 +88,11 @@ def main() -> None:
             st.warning("⚠️ Vui lòng chọn ít nhất một địa điểm.")
             st.stop()
 
-        if not train_cfg["feature_cols"]:
+        feature_cols = list(train_cfg["feature_cols"])
+        if train_cfg["target_col"] not in feature_cols:
+            feature_cols.append(train_cfg["target_col"])
+
+        if not feature_cols:
             st.warning("⚠️ Vui lòng chọn ít nhất một cột feature.")
             st.stop()
 
@@ -104,7 +108,7 @@ def main() -> None:
                     forecast_base_df=None,
                     selected_locations=selected_locations,
                     target_col=train_cfg["target_col"],
-                    feature_cols=train_cfg["feature_cols"],
+                    feature_cols=feature_cols,
                     epochs=train_cfg["epochs"],
                     batch_size=train_cfg["batch_size"],
                     lr=train_cfg["lr"],
@@ -127,6 +131,8 @@ def main() -> None:
                 tft_run_dir = os.path.join(base_run_dir, "tft")
                 tft_summary, tft_hist_df, tft_pred_df = run_tft_pipeline(
                     selected_locations=selected_locations,
+                    target_col=train_cfg["target_col"],
+                    feature_cols=feature_cols,
                     epochs=train_cfg["epochs"],
                     batch_size=train_cfg["batch_size"],
                     lr=train_cfg["lr"],
@@ -145,8 +151,8 @@ def main() -> None:
                     df=df,
                     selected_locations=selected_locations,
                     target_col=train_cfg["target_col"],
-                    feature_cols=train_cfg["feature_cols"],
-                    lookback=cmp_cfg["lstm_lookback"],
+                    feature_cols=feature_cols,
+                    lookback=24,
                     horizon=1,
                     epochs=train_cfg["epochs"],
                     batch_size=train_cfg["batch_size"],
