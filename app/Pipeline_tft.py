@@ -221,6 +221,31 @@ def run_tft_pipeline(
     last_rmse = float(np.sqrt(mse))
     last_r2 = float(r2_score(y_true, y_pred_arr))
 
+    # --- Normalized metrics (use TFT train scaler) ---
+    mae_norm = np.nan
+    rmse_norm = np.nan
+    try:
+        tft_sys_path = str(tft_root)
+        if tft_sys_path not in sys.path:
+            sys.path.insert(0, tft_sys_path)
+        from data_formatters.air_quality import AirQualityFormatter
+
+        df_full = pd.read_csv(cfg["data_csv_path"])
+        formatter = AirQualityFormatter(selected_locations=selected_locations)
+        formatter.split_data(df_full)
+        scaler = formatter._global_target_scaler
+        if scaler is not None and scaler.scale_ is not None:
+            mean = float(scaler.mean_[0])
+            std = float(scaler.scale_[0]) if float(scaler.scale_[0]) >= 1e-6 else 1.0
+            y_true_norm = (y_true - mean) / std
+            y_pred_norm = (y_pred_arr - mean) / std
+            mse_norm = mean_squared_error(y_true_norm, y_pred_norm)
+            mae_norm = float(mean_absolute_error(y_true_norm, y_pred_norm))
+            rmse_norm = float(np.sqrt(mse_norm))
+    except Exception:
+        mae_norm = np.nan
+        rmse_norm = np.nan
+
     summary: dict = {
         "model": "tft",
         "device": cfg["device"],
@@ -228,6 +253,8 @@ def run_tft_pipeline(
         "test_mae": last_mae,
         "test_rmse": last_rmse,
         "test_r2": last_r2,
+        "test_mae_norm": mae_norm,
+        "test_rmse_norm": rmse_norm,
         "run_sec": float(run_sec),
         "pred_path": str(pred_path),
         "log_dir": str(latest_run_dir),

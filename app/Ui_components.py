@@ -24,6 +24,15 @@ from Utils import load_train_module, split_data_by_timeline
 _UPLOAD_TEMP_DIR = Path(__file__).parent.parent / "runs" / "uploaded"
 
 
+def _fmt_metric(value, fallback=np.nan) -> str:
+    try:
+        if value is None:
+            value = fallback
+        return f"{float(value):.4f}"
+    except Exception:
+        return f"{float(fallback):.4f}"
+
+
 # ---------------------------------------------------------------------------
 # Sidebar & dataset loading
 # ---------------------------------------------------------------------------
@@ -403,8 +412,8 @@ def render_mamba_results(summary: dict, hist_df: pd.DataFrame, future_df: pd.Dat
     st.success("Train/Test hoàn tất")
 
     met1, met2, met3, met4 = st.columns(4)
-    met1.metric("Val MAE", f"{summary['val_mae']:.4f}")
-    met2.metric("Val RMSE", f"{summary['val_rmse']:.4f}")
+    met1.metric("Val MAE (norm)", _fmt_metric(summary.get("val_mae_norm")))
+    met2.metric("Val RMSE (norm)", _fmt_metric(summary.get("val_rmse_norm")))
     met3.metric("Val R2", f"{summary['val_r2']:.4f}")
     met4.metric("Locations done", f"{int(summary['future_locations']):,}")
 
@@ -496,6 +505,10 @@ def render_tft_results(tft_summary: dict, tft_hist_df: pd.DataFrame | None, tft_
             },
         ]
     )
+    met1, met2, met3 = st.columns(3)
+    met1.metric("Test MAE (norm)", _fmt_metric(tft_summary.get("test_mae_norm")))
+    met2.metric("Test RMSE (norm)", _fmt_metric(tft_summary.get("test_rmse_norm")))
+    met3.metric("Test R2", f"{tft_summary.get('test_r2', float('nan')):.4f}")
     st.write("### TFT benchmark modes")
     st.dataframe(tft_modes_df, use_container_width=True)
 
@@ -513,8 +526,8 @@ def render_lstm_results(
     if lstm_summary is not None:
         st.success("Train/Test LSTM hoàn tất")
         met1, met2, met3, met4 = st.columns(4)
-        met1.metric("Val MAE",  f"{lstm_summary.get('val_mae',  float('nan')):.4f}")
-        met2.metric("Val RMSE", f"{lstm_summary.get('val_rmse', float('nan')):.4f}")
+        met1.metric("Val MAE (norm)",  _fmt_metric(lstm_summary.get("val_mae_norm")))
+        met2.metric("Val RMSE (norm)", _fmt_metric(lstm_summary.get("val_rmse_norm")))
         met3.metric("Val R²",   f"{lstm_summary.get('val_r2',   float('nan')):.4f}")
         met4.metric("Locations", f"{int(lstm_summary.get('future_locations', 0)):,}")
 
@@ -555,8 +568,8 @@ def render_comparison_table(
     if summary is not None:
         rows.append({
             "model": "Mamba",
-            "test_mae":  summary.get("test_mae",       np.nan),
-            "test_rmse": summary.get("test_rmse",      np.nan),
+            "test_mae_norm":  summary.get("test_mae_norm",  np.nan),
+            "test_rmse_norm": summary.get("test_rmse_norm", np.nan),
             "test_r2":   summary.get("test_r2",        np.nan),
             "train_sec": summary.get("train_only_sec", np.nan),
             "run_sec":   summary.get("run_sec",        np.nan),
@@ -565,8 +578,8 @@ def render_comparison_table(
     if tft_summary is not None:
         rows.append({
             "model": "TFT",
-            "test_mae":  tft_summary.get("test_mae",       np.nan),
-            "test_rmse": tft_summary.get("test_rmse",      np.nan),
+            "test_mae_norm":  tft_summary.get("test_mae_norm",  np.nan),
+            "test_rmse_norm": tft_summary.get("test_rmse_norm", np.nan),
             "test_r2":   tft_summary.get("test_r2",        np.nan),
             "train_sec": tft_summary.get("train_only_sec", np.nan),
             "run_sec":   tft_summary.get("run_sec",        np.nan),
@@ -575,8 +588,8 @@ def render_comparison_table(
     if lstm_summary is not None:
         rows.append({
             "model": "LSTM",
-            "test_mae":  lstm_summary.get("test_mae",       np.nan),
-            "test_rmse": lstm_summary.get("test_rmse",      np.nan),
+            "test_mae_norm":  lstm_summary.get("test_mae_norm",  np.nan),
+            "test_rmse_norm": lstm_summary.get("test_rmse_norm", np.nan),
             "test_r2":   lstm_summary.get("test_r2",        np.nan),
             "train_sec": lstm_summary.get("train_only_sec", np.nan),
             "run_sec":   lstm_summary.get("run_sec",        np.nan),
@@ -593,12 +606,12 @@ def render_comparison_table(
     st.dataframe(cmp_df, use_container_width=True)
 
     if len(rows) >= 2:
-        mae_best  = cmp_df.loc[cmp_df["test_mae"].idxmin(),  "model"]
-        rmse_best = cmp_df.loc[cmp_df["test_rmse"].idxmin(), "model"]
+        mae_best  = cmp_df.loc[cmp_df["test_mae_norm"].idxmin(),  "model"]
+        rmse_best = cmp_df.loc[cmp_df["test_rmse_norm"].idxmin(), "model"]
         r2_best   = cmp_df.loc[cmp_df["test_r2"].idxmax(),   "model"]
         col1, col2, col3 = st.columns(3)
-        col1.metric("Best MAE",  mae_best)
-        col2.metric("Best RMSE", rmse_best)
+        col1.metric("Best MAE (norm)",  mae_best)
+        col2.metric("Best RMSE (norm)", rmse_best)
         col3.metric("Best R²",   r2_best)
 
 

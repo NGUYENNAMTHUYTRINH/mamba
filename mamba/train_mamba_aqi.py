@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 # --- Đảm bảo Python tìm thấy thư mục gốc của project khi chạy trực tiếp ---
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -315,7 +316,17 @@ def evaluate(
     preds_arr   = denormalize(np.concatenate(preds),   y_mean, y_std)
     targets_arr = denormalize(np.concatenate(targets), y_mean, y_std)
 
+    preds_norm_arr = np.concatenate(preds).astype(np.float32).flatten()
+    targets_norm_arr = np.concatenate(targets).astype(np.float32).flatten()
+
     metrics = compute_metrics(targets_arr, preds_arr)
+    try:
+        mse_norm = mean_squared_error(targets_norm_arr, preds_norm_arr)
+        metrics["mae_norm"] = float(mean_absolute_error(targets_norm_arr, preds_norm_arr))
+        metrics["rmse_norm"] = float(np.sqrt(mse_norm))
+    except Exception:
+        metrics["mae_norm"] = float("nan")
+        metrics["rmse_norm"] = float("nan")
     metrics["loss"] = total_loss / len(loader.dataset)
     return metrics
 
@@ -420,7 +431,7 @@ def main() -> None:
 
     with open(history_path, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(
-            ["epoch", "train_loss", "val_loss", "val_mae", "val_rmse", "val_r2", "train_sec"]
+            ["epoch", "train_loss", "val_loss", "mae", "rmse", "val_r2", "train_sec"]
         )
 
     for epoch in range(1, args.epochs + 1):
@@ -435,7 +446,9 @@ def main() -> None:
             "Epoch %02d/%02d | train=%.6f | val_loss=%.6f | mae=%.4f | rmse=%.4f | r2=%.4f | %.1fs",
             epoch, args.epochs,
             train_loss, val_metrics["loss"],
-            val_metrics["mae"], val_metrics["rmse"], val_metrics["r2"],
+            val_metrics.get("mae_norm", float("nan")),
+            val_metrics.get("rmse_norm", float("nan")),
+            val_metrics["r2"],
             train_sec,
         )
 
@@ -444,8 +457,8 @@ def main() -> None:
                 epoch,
                 f"{train_loss:.8f}",
                 f"{val_metrics['loss']:.8f}",
-                f"{val_metrics['mae']:.8f}",
-                f"{val_metrics['rmse']:.8f}",
+                f"{val_metrics.get('mae_norm', float('nan')):.8f}",
+                f"{val_metrics.get('rmse_norm', float('nan')):.8f}",
                 f"{val_metrics['r2']:.8f}",
                 f"{train_sec:.2f}",
             ])

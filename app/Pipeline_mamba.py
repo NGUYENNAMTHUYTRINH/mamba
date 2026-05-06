@@ -40,17 +40,27 @@ def evaluate(model, loader, criterion, device, y_mean: float, y_std: float) -> d
     model.eval()
     total_loss = 0.0
     preds, targets = [], []
+    preds_norm, targets_norm = [], []
 
     for xb, loc_ids, yb in loader:
         xb, loc_ids, yb = xb.to(device), loc_ids.to(device), yb.to(device)
         out = model(xb, loc_ids)
         loss = criterion(out, yb)
         total_loss += loss.item() * yb.size(0)
+        preds_norm.append(out.detach().cpu().numpy())
+        targets_norm.append(yb.detach().cpu().numpy())
         preds.append(out.detach().cpu().numpy())
         targets.append(yb.detach().cpu().numpy())
 
     preds_arr = np.concatenate(preds, axis=0) * y_std + y_mean
     targets_arr = np.concatenate(targets, axis=0) * y_std + y_mean
+
+    preds_norm_arr = np.concatenate(preds_norm, axis=0)
+    targets_norm_arr = np.concatenate(targets_norm, axis=0)
+
+    mse_norm = mean_squared_error(targets_norm_arr, preds_norm_arr)
+    mae_norm = mean_absolute_error(targets_norm_arr, preds_norm_arr)
+    rmse_norm = float(np.sqrt(mse_norm))
 
     mse = mean_squared_error(targets_arr, preds_arr)
     return {
@@ -58,6 +68,8 @@ def evaluate(model, loader, criterion, device, y_mean: float, y_std: float) -> d
         "mae": float(mean_absolute_error(targets_arr, preds_arr)),
         "rmse": float(np.sqrt(mse)),
         "r2": float(r2_score(targets_arr, preds_arr)),
+        "mae_norm": float(mae_norm),
+        "rmse_norm": float(rmse_norm),
         "preds": preds_arr,
         "targets": targets_arr,
     }
@@ -242,8 +254,8 @@ def train_pipeline(
 
         epoch_line = (
             f"Epoch {epoch}/{epochs} done | train_loss={train_loss:.6f} | "
-            f"val_loss={val_metrics['loss']:.6f} | val_mae={val_metrics['mae']:.4f} | "
-            f"val_rmse={val_metrics['rmse']:.4f} | val_r2={val_metrics['r2']:.4f} | "
+            f"val_loss={val_metrics['loss']:.6f} | mae={val_metrics.get('mae_norm', float('nan')):.4f} | "
+            f"rmse={val_metrics.get('rmse_norm', float('nan')):.4f} | val_r2={val_metrics['r2']:.4f} | "
             f"sec={epoch_sec:.1f}"
         )
         log_lines.append(epoch_line)
@@ -254,8 +266,8 @@ def train_pipeline(
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_loss": val_metrics["loss"],
-                "val_mae": val_metrics["mae"],
-                "val_rmse": val_metrics["rmse"],
+                "mae": val_metrics.get("mae_norm"),
+                "rmse": val_metrics.get("rmse_norm"),
                 "val_r2": val_metrics["r2"],
                 "train_sec": epoch_sec,
             }
@@ -403,13 +415,15 @@ def train_pipeline(
         "feature_count_after_encode": train_split.x_seq.shape[-1],
         "encoded_features": ts_feature_cols,
         "val_loss": val_metrics["loss"],
-        "val_mae": val_metrics["mae"],
-        "val_rmse": val_metrics["rmse"],
         "val_r2": val_metrics["r2"],
+        "val_mae_norm": val_metrics.get("mae_norm"),
+        "val_rmse_norm": val_metrics.get("rmse_norm"),
         "test_loss": test_metrics["loss"],
         "test_mae": test_metrics["mae"],
         "test_rmse": test_metrics["rmse"],
         "test_r2": test_metrics["r2"],
+        "test_mae_norm": test_metrics.get("mae_norm"),
+        "test_rmse_norm": test_metrics.get("rmse_norm"),
         "model_path": model_path,
         "metrics_path": metrics_path,
         "future_pred_path": future_pred_path,
