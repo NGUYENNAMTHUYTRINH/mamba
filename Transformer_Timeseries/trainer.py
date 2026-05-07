@@ -296,8 +296,12 @@ class Trainer(object):
         all_targets = []
         all_preds = []
         all_loc_ids = []
+        all_targets_norm = []
+        all_preds_norm = []
         mae = np.nan
         rmse = np.nan
+        mae_raw = np.nan
+        rmse_raw = np.nan
         r2 = np.nan
 
         t = time()
@@ -347,6 +351,8 @@ class Trainer(object):
             # Collect unnormalized targets and predictions for Regression Metrics
             all_targets.append(target.flatten())
             all_preds.append(pred_forecast.flatten())
+            all_targets_norm.append(y_np.flatten())
+            all_preds_norm.append(y_pred_np.flatten())
             identifiers = sample.get('identifier', None)
             if identifiers is not None:
                 id_arr = np.array(identifiers, dtype=object)
@@ -387,13 +393,19 @@ class Trainer(object):
             final_targets = np.concatenate(all_targets)
             final_preds = np.concatenate(all_preds)
 
-            mae = mean_absolute_error(final_targets, final_preds)
-            mse = mean_squared_error(final_targets, final_preds)
-            rmse = np.sqrt(mse)
+            mae_raw = mean_absolute_error(final_targets, final_preds)
+            mse_raw = mean_squared_error(final_targets, final_preds)
+            rmse_raw = np.sqrt(mse_raw)
             r2 = r2_score(final_targets, final_preds)
 
+            final_targets_norm = np.concatenate(all_targets_norm)
+            final_preds_norm = np.concatenate(all_preds_norm)
+            mae = mean_absolute_error(final_targets_norm, final_preds_norm)
+            mse = mean_squared_error(final_targets_norm, final_preds_norm)
+            rmse = np.sqrt(mse)
+
             print("\n" + "="*50)
-            print("KET QUA DANH GIA TREN TAP TEST (MAMBA COMPARISON)")
+            print("KET QUA DANH GIA TREN TAP TEST (NORMALIZED)")
             print("="*50)
             print(f"MAE:  {mae:.4f}")
             print(f"RMSE: {rmse:.4f}")
@@ -409,6 +421,10 @@ class Trainer(object):
             'test_smape': float(mean_smape),
             'test_mae': float(mae),
             'test_rmse': float(rmse),
+            'test_mae_norm': float(mae),
+            'test_rmse_norm': float(rmse),
+            'test_mae_raw': float(mae_raw),
+            'test_rmse_raw': float(rmse_raw),
             'test_r2': float(r2),
             'all_targets': np.concatenate(all_targets) if len(all_targets) > 0 else np.array([]),
             'all_preds': np.concatenate(all_preds) if len(all_preds) > 0 else np.array([]),
@@ -450,6 +466,10 @@ class Trainer(object):
                 'test_smape': float(test_metrics.get('test_smape', np.nan)),
                 'test_mae': float(test_metrics.get('test_mae', np.nan)),
                 'test_rmse': float(test_metrics.get('test_rmse', np.nan)),
+                'test_mae_norm': float(test_metrics.get('test_mae_norm', np.nan)),
+                'test_rmse_norm': float(test_metrics.get('test_rmse_norm', np.nan)),
+                'test_mae_raw': float(test_metrics.get('test_mae_raw', np.nan)),
+                'test_rmse_raw': float(test_metrics.get('test_rmse_raw', np.nan)),
                 'test_r2': float(test_metrics.get('test_r2', np.nan)),
                 # Use 'train_sec' key (consistent with run_tft_pipeline lookup)
                 'train_sec': float(train_metrics.get('epoch_sec', np.nan)),

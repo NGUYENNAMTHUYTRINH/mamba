@@ -275,6 +275,8 @@ def run_tft_pipeline(
         "test_r2": last_r2,
         "test_mae_norm": mae_norm,
         "test_rmse_norm": rmse_norm,
+        "test_mae_raw": last_mae,
+        "test_rmse_raw": last_rmse,
         "run_sec": float(run_sec),
         "pred_path": str(pred_path),
         "log_dir": str(latest_run_dir),
@@ -303,6 +305,13 @@ def run_tft_pipeline(
             best_row = history_df.loc[best_idx]
             last_row = history_df.iloc[-1]
 
+            hist_mae_norm = best_row.get("test_mae_norm", np.nan)
+            hist_rmse_norm = best_row.get("test_rmse_norm", np.nan)
+            if pd.isna(hist_mae_norm):
+                hist_mae_norm = best_row.get("test_mae", np.nan)
+            if pd.isna(hist_rmse_norm):
+                hist_rmse_norm = best_row.get("test_rmse", np.nan)
+
             summary.update(
                 {
                     "tft_best_epoch": int(best_row.get("epoch", np.nan)),
@@ -317,6 +326,10 @@ def run_tft_pipeline(
                     "tft_hist_last_test_r2": float(last_row.get("test_r2", np.nan)),
                     "test_mae": float(best_row.get("test_mae", np.nan)),
                     "test_rmse": float(best_row.get("test_rmse", np.nan)),
+                    "test_mae_norm": float(hist_mae_norm),
+                    "test_rmse_norm": float(hist_rmse_norm),
+                    "test_mae_raw": float(best_row.get("test_mae_raw", best_row.get("test_mae", np.nan))),
+                    "test_rmse_raw": float(best_row.get("test_rmse_raw", best_row.get("test_rmse", np.nan))),
                     "test_r2": float(best_row.get("test_r2", np.nan)),
                     "selection": "best_test_loss",
                 }

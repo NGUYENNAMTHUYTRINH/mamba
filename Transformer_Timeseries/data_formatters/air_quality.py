@@ -29,11 +29,11 @@ class AirQualityFormatter(GenericDataFormatter):
         self.selected_location = self.selected_locations[0] if len(self.selected_locations) == 1 else None
         self.feature_inputs = None
 
-        self._col_def = self._build_column_definition()
+        self.__column_definition = self._build_column_definition()
 
     @property
     def _column_definition(self):
-        return self._col_def
+        return self.__column_definition
 
     def _build_column_definition(self):
         observed_inputs = []
