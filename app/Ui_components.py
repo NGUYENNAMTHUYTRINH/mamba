@@ -283,11 +283,17 @@ def render_train_config() -> dict:
             options=feature_options,
             index=feature_options.index("aqi") if "aqi" in feature_options else 0,
         )
-        default_features = [c for c in feature_options if c != target_col]
+        default_features = [c for c in feature_options if c != target_col] + [target_col]
         feature_cols = st.multiselect(
             "Input feature columns",
-            options=[c for c in feature_options if c != target_col],
+            options=feature_options,
             default=default_features,
+        )
+        final_features = list(feature_cols)
+        if target_col not in final_features:
+            final_features.append(target_col)
+        st.caption(
+            "Input features (incl. target history): " + ", ".join(final_features)
         )
         loss_name = st.selectbox("Loss", options=["huber", "mse"], index=0)
 
